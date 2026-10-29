@@ -23,12 +23,15 @@ python -m pip install pywin32 psutil pygments
 
 ```powershell
 python -I test/relay_test.py
+node test/stop_test.js
 ```
 
 The tests run the launcher's rules without named pipes or the sandbox: the relay's allowlists and refusals, that a port
 is never taken from the vault, `.env` parsing and the Cloudflare Access settings, the names derived from
 `IGNIS_CONTAINER_PREFIX` (and the refusal of a hostile one), that values reach PowerShell only as environment variables,
-and the ignored paths. They read no real settings: `ignis/.env` and the environment are replaced by temporary ones.
+and the ignored paths. `test/stop_test.js` checks that **Stop** asks Windows which program has the launcher's process
+id and refuses any program but `python.exe` or `pythonw.exe` (it starts and ends one Python process of its own). The
+Python tests read no real settings: `ignis/.env` and the environment are replaced by temporary ones.
 When an Ignis checkout (`app\`) and Node are beside the script, the ignored paths are also checked with Ignis's own
 matcher.
 

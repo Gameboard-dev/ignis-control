@@ -1,7 +1,7 @@
 {
   "id": "ignis-control",
   "name": "Ignis Control",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "minAppVersion": "1.8.7",
   "description": "Run and monitor the Ignis server that serves your vault to web browsers from a Windows PC: status and controls on desktop, and from any device its options, plugin exclusions and tab diagnostics.",
   "author": "Gameboard-dev",

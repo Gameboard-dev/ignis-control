@@ -299,22 +299,36 @@ module.exports = class IgnisControl extends Plugin {
     window.setTimeout(() => this.refresh(), 3000);
   }
 
-  stop() {
+  // Ends the launcher; true when it was asked to end. The process id comes from status.json, so before anything is
+  // killed, Windows is asked which program has that id: only python.exe or pythonw.exe (the launcher) is stopped.
+  async stop() {
     const s = this.status;
-    if (!this.launcherAlive(s)) return new Notice("Ignis is not running.");
+    if (!this.launcherAlive(s)) {
+      new Notice("Ignis is not running.");
+      return false;
+    }
+    const pid = s.launcher.pid;
+    const why = await checkLauncherProcess(pid);
+    if (why) {
+      new Notice(`Ignis: not stopped: ${why}.`, 10000);
+      return false;
+    }
     try {
-      process.kill(s.launcher.pid); // the launcher's job object ends Ignis, cloudflared and the forwarder with it
+      process.kill(pid); // the launcher's job object ends Ignis, cloudflared and the forwarder with it
       new Notice("Ignis: stopped.");
     } catch (e) {
-      new Notice(`Ignis: could not stop the launcher (process ${s.launcher.pid}): ${e.message}`);
+      new Notice(`Ignis: could not stop the launcher (process ${pid}): ${e.message}`);
+      return false;
+    } finally {
+      window.setTimeout(() => this.refresh(), 500);
     }
-    window.setTimeout(() => this.refresh(), 500);
+    return true;
   }
 
   async restart() {
     const s = this.status;
     if (this.launcherAlive(s)) {
-      this.stop();
+      if (!(await this.stop())) return; // not the launcher, or it could not be stopped: start nothing
       for (let i = 0; i < 40; i++) { // up to 10 s for the launcher to exit
         await sleep(250);
         try { process.kill(s.launcher.pid, 0); } catch { break; }
@@ -822,3 +836,45 @@ function age(epochSeconds) {
 function sleep(ms) {
   return new Promise((r) => window.setTimeout(r, ms));
 }
+
+// --- is this process id the launcher? (before Stop kills it) ---
+
+// The launcher runs under Python; any other program with that id (a stale or altered status.json) is left alone.
+const LAUNCHER_IMAGES = ["python.exe", "pythonw.exe"];
+
+function isLauncherImage(name) {
+  return LAUNCHER_IMAGES.includes(String(name).toLowerCase());
+}
+
+// The image name `tasklist /FO CSV /NH` reports for `pid` ("name","pid",...), or "" when no line is that process
+function imageFromTasklist(csv, pid) {
+  for (const line of String(csv).split(/\r?\n/)) {
+    const m = /^"([^"]*)","(\d+)"/.exec(line.trim());
+    if (m && Number(m[2]) === pid) return m[1];
+  }
+  return "";
+}
+
+// Windows' tasklist.exe by its full path (never a PATH lookup), started with an argument array: no shell
+function tasklistPath() {
+  return path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tasklist.exe");
+}
+
+// Why `pid` must not be stopped as the launcher, or null when it is python.exe or pythonw.exe. (Windows offers no
+// shell-free way from here to read a process's full path, so the image name is what is checked.)
+function checkLauncherProcess(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return Promise.resolve(`the status file names no valid process id (${pid})`);
+  return new Promise((resolve) => {
+    execFile(tasklistPath(), ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { windowsHide: true, timeout: 15000 },
+      (err, stdout) => {
+        if (err) return resolve(`could not check process ${pid} (${err.message})`);
+        const image = imageFromTasklist(stdout, pid);
+        if (!image) return resolve(`process ${pid} no longer exists`);
+        resolve(isLauncherImage(image) ? null
+          : `process ${pid} is ${image}, not the launcher (python.exe or pythonw.exe); the status file may be stale`);
+      });
+  });
+}
+
+// for test/stop_test.js (plain Node, with Obsidian's module stubbed)
+module.exports.forTests = { isLauncherImage, imageFromTasklist, tasklistPath, checkLauncherProcess };

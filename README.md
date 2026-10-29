@@ -5,15 +5,22 @@ Tunnel behind Cloudflare Access, and control it from Obsidian.
 
 **Windows only. Tested on Windows 11 Pro.**
 
+> **Unofficial.** [Ignis](https://github.com/Nystik-gh/ignis) is a separate project by its own author, Nystik
+> ([documentation](https://ignis.thiefling.com/docs/)). Ignis Control is an unofficial companion written by someone
+> else: it is not part of Ignis, and it is not affiliated with or endorsed by Ignis's author or by Obsidian. Problems
+> with Ignis Control belong in [this repository's issues](https://github.com/Gameboard-dev/ignis-control/issues), not
+> Ignis's. Ignis Control is not listed in Obsidian's community plugins; it is installed by hand or with BRAT.
+
 Ignis serves an Obsidian vault as a web page: any browser, on any device, opens the vault in the real Obsidian app with
 its plugins. Ignis has no login of its own. Ignis Control runs it on your PC in a Windows sandbox, puts Cloudflare's
 login in front of it, and gives you a status bar indicator and a control panel in Obsidian. It is for a person who
 keeps a vault on a Windows PC and wants to open it from a phone or another computer without opening a port on the PC.
 
-## Disclosures (Obsidian's developer policies)
+## Disclosures
 
-As [Obsidian's developer policies](https://docs.obsidian.md/community-directory/developer-policies) ask, in short (the full account is
-[docs/disclosures.md](docs/disclosures.md)):
+Ignis Control is not in Obsidian's community plugins, but it follows what
+[Obsidian's developer policies](https://docs.obsidian.md/community-directory/developer-policies) ask listed plugins to
+disclose, so you know what you install. In short (the full account is [docs/disclosures.md](docs/disclosures.md)):
 
 - **Desktop only, Windows only.** The plugin starts and stops a separate program on your PC, the launcher
   (`ignis_native.py`, a Python script you install yourself). It runs nothing else, and never downloads or installs
@@ -73,9 +80,10 @@ As [Obsidian's developer policies](https://docs.obsidian.md/community-directory/
 
 ## Install
 
-- **The plugin:** from Obsidian's community plugins once it is listed there, or copy `main.js`, `manifest.json` and
-  `styles.css` from a [release](https://github.com/Gameboard-dev/ignis-control/releases) into
-  `<vault>\.obsidian\plugins\ignis-control\`.
+- **The plugin:** copy `main.js`, `manifest.json` and `styles.css` from a
+  [release](https://github.com/Gameboard-dev/ignis-control/releases) into `<vault>\.obsidian\plugins\ignis-control\`,
+  or add `Gameboard-dev/ignis-control` in the [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin, which
+  installs and updates plugins from GitHub releases. It is not in Obsidian's community plugins.
 - **The launcher:** clone this repository, or download the release's **Source code (zip)**; the launcher and its files
   are plain source. It is installed by hand, once, as [docs/installation.md](docs/installation.md) describes.
 
@@ -137,6 +145,7 @@ loads, so admit only yourself. The launcher itself runs with your rights. Detail
 
 ## Licence
 
-The plugin, the launcher (`ignis_native.py`, `launcher/`) and the forwarder (`relay/`) are under the
+Ignis is the work of Nystik, under the GNU Affero General Public License 3.0 or later
+([Nystik-gh/ignis](https://github.com/Nystik-gh/ignis)). The plugin, the launcher (`ignis_native.py`, `launcher/`) and the forwarder (`relay/`) are under the
 [MIT licence](LICENSE). The files in `patches/` modify Ignis and are under the GNU Affero General Public License 3.0
 or later, as Ignis is ([patches/LICENSE](patches/LICENSE)). More: [docs/licences.md](docs/licences.md).

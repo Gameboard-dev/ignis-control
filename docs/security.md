@@ -30,6 +30,7 @@ publishes it on the internet, so it assumes:
 | Cookies and Access tokens | Leaking to desktop services | The Ignis server forwards only seven listed headers; the Access token goes only to `latex` |
 | The tunnel token | Theft from a file or the log | Kept in Credential Manager ([below](#the-tunnel-token)) |
 | The LaTeX build | Running a command chosen by the request | A fixed command sequence; nothing from the request reaches a command line ([Plugin-Integration/LaTeX.md](Plugin-Integration/LaTeX.md)) |
+| Other programs on the PC | **Stop** killing a program that is not the launcher (a stale or altered `status.json`) | The plugin asks Windows which program has the id and stops only `python.exe` or `pythonw.exe` |
 | Program paths on desktop | The browser choosing the program desktop Obsidian runs | The `ignis\` folder and the Python path are kept per device, outside the vault ([configuration.md](configuration.md#plugin-settings)) |
 | Commands the launcher and the plugin run | A folder or file name with quotes, `&` or `;` changing a command | Every program is started with an argument list, never through a shell; Windows' own tools by full path from `%SystemRoot%\System32`; the few PowerShell commands are fixed text, with their values passed as environment variables (tested with hostile values in `test/relay_test.py`) |
 | Files moved into the vault | Breaking the access rule | The launcher repairs entries without following links ([architecture.md](architecture.md#the-vaults-access-rule)) |

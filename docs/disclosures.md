@@ -2,12 +2,13 @@
 
 [← README](../README.md)
 
-Ignis Control is written to meet Obsidian's
-[Developer policies](https://docs.obsidian.md/community-directory/developer-policies), the
-[Submission requirements for plugins](https://docs.obsidian.md/Plugins/Releasing/Submission+requirements+for+plugins)
-and the [Plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines). This page goes through what
-those policies ask a plugin to disclose, and what they forbid, and says plainly what Ignis Control does about each and
-why. It covers the plugin and the launcher it controls, because the plugin is only useful with the launcher.
+Ignis Control is not listed in Obsidian's community plugins, and it is an unofficial companion to
+[Ignis](https://github.com/Nystik-gh/ignis), not affiliated with or endorsed by Ignis's author or by Obsidian. It still
+follows Obsidian's [Developer policies](https://docs.obsidian.md/community-directory/developer-policies) and
+[Plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines), so that anyone installing it by
+hand knows what it does. This page goes through what those policies ask a plugin to disclose, and what they forbid,
+and says plainly what Ignis Control does about each and why. It covers the plugin and the launcher it controls,
+because the plugin is only useful with the launcher.
 
 - [In short](#in-short)
 - [Payment](#payment)
@@ -88,8 +89,10 @@ The Python path and the Ignis folder are kept on each device (Obsidian's local s
 `location.json` in `%LOCALAPPDATA%`, never from the vault's `data.json`: the vault can be changed from the browser,
 and a path stored there could choose the program desktop Obsidian runs. The plugin accepts only an absolute path whose
 file name is `python.exe` or `pythonw.exe`. **Stop** ends the launcher's process (its id is in the launcher's status
-file, which is outside the vault and is checked to be fresh and to name a running process); Windows then ends
-everything the launcher started, through its job object. Inside Ignis, the plugin cannot start or stop anything.
+file, which is outside the vault). Before killing it, the plugin checks that the status file is fresh and asks
+Windows (`tasklist.exe` by its full path, with an argument list) which program has that id: only `python.exe` or
+`pythonw.exe` is stopped, and any other program is refused with a message. Windows then ends everything the launcher
+started, through its job object. Inside Ignis, the plugin cannot start or stop anything.
 
 **The launcher** runs, outside the sandbox and with your rights, each with an argument list and Windows' own tools by
 their full path in `%SystemRoot%\System32`:

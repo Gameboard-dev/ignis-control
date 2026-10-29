@@ -2,6 +2,16 @@
 
 [← README](../README.md)
 
+## Ignis
+
+[Ignis](https://github.com/Nystik-gh/ignis) ("Ignis - Obsidian server bridge") is the work of its author, Nystik,
+Copyright (C) 2026 Nystik, and is free software under the
+[GNU Affero General Public License, version 3 or later](https://www.gnu.org/licenses/agpl-3.0.html). Its documentation
+is at [ignis.thiefling.com/docs](https://ignis.thiefling.com/docs/). Ignis Control is an unofficial companion to it,
+written by someone else and not affiliated with or endorsed by Ignis's author (or by Obsidian). Everything Ignis does
+(serving the vault and Obsidian to a browser, its proxy, its settings) is Ignis's own work; Ignis Control adds a
+launcher, a sandbox, the relay and a control panel around it, and six patches to it.
+
 ## This repository
 
 | Files | Licence |

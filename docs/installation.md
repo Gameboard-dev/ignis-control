@@ -21,8 +21,9 @@ The Cloudflare side (domain, Access, tunnel) is in [cloudflare.md](cloudflare.md
 Ignis Control has two parts, obtained separately:
 
 - **The Obsidian plugin** (`main.js`, `manifest.json`, `styles.css`): the assets of each
-  [release](https://github.com/Gameboard-dev/ignis-control/releases), or Obsidian's community plugin browser once it
-  is listed there.
+  [release](https://github.com/Gameboard-dev/ignis-control/releases), copied by hand, or installed with the
+  [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin (`Gameboard-dev/ignis-control`). Ignis Control is not in
+  Obsidian's community plugins.
 - **The launcher and its files** (`ignis_native.py`, `relay\`, `patches\`, and the optional access watcher's source in
   `launcher\`): a clone of this repository, or the **Source code (zip)** archive attached to the same release, unpacked.
   They are plain source files: there is no installer and no binary to download, and neither the plugin nor the launcher
@@ -362,8 +363,8 @@ Details: [launcher/README.md](../launcher/README.md).
 1. Read the release notes. Stop the launcher (**Stop** in the plugin).
 2. Copy the new `ignis_native.py` and `relay\augmented-view-forwarder.js` into `<root>\ignis\`. Rebuild and copy
    `ignis-launcher.exe` if you use the access watcher.
-3. Update the plugin (Obsidian's community plugins, or copy the new `main.js`, `manifest.json` and `styles.css` into
-   `<vault>\.obsidian\plugins\ignis-control\`), and reload it in desktop Obsidian.
+3. Update the plugin (copy the new `main.js`, `manifest.json` and `styles.css` into
+   `<vault>\.obsidian\plugins\ignis-control\`, or let BRAT update it), and reload it in desktop Obsidian.
 4. Start the launcher, then run `check`.
 
 ### From version 0.3
