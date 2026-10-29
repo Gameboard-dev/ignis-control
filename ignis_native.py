@@ -682,6 +682,31 @@ def tunnel_hosts() -> list[str]:
 TOKEN_TARGET = f"{NAME}/cloudflared-tunnel-token"
 
 
+# The tunnel's transport (cloudflared's --protocol): IGNIS_TUNNEL_PROTOCOL, default quic.
+#   quic   UDP to Cloudflare's edge on port 7844 (the default, and what earlier versions always used)
+#   http2  TLS over TCP on port 7844: for networks that block or disturb UDP. Antivirus that re-signs TLS (HTTPS
+#          scanning) breaks it: cloudflared then rejects the edge's certificate, unless cloudflared.exe or
+#          *.argotunnel.com is excluded from that scanning
+#   auto   cloudflared's own choice: QUIC, falling back to HTTP/2 when QUIC fails
+TUNNEL_PROTOCOLS = ("quic", "http2", "auto")
+
+
+def tunnel_protocol(value: Optional[str]) -> tuple[str, str]:
+    """(the protocol, "") from IGNIS_TUNNEL_PROTOCOL (empty: quic), or ("", why) when it is not one of
+    TUNNEL_PROTOCOLS; the launcher then does not start."""
+    v = (value or "quic").strip().lower()
+    if v in TUNNEL_PROTOCOLS:
+        return v, ""
+    return "", (f"IGNIS_TUNNEL_PROTOCOL={value!r} is not a tunnel protocol: use one of {', '.join(TUNNEL_PROTOCOLS)} "
+                f"(in {IGNIS / '.env'} or the environment); the launcher does not start")
+
+
+def cloudflared_args(protocol: str) -> list[str]:
+    """cloudflared's command line, as an argument list (no shell); `protocol` from tunnel_protocol."""
+    assert protocol in TUNNEL_PROTOCOLS
+    return [str(CLOUDFLARED), "tunnel", "--no-autoupdate", "--protocol", protocol, "--edge-ip-version", "4", "run"]
+
+
 def tunnel_token() -> str:
     import pywintypes
     import win32cred
@@ -1265,6 +1290,7 @@ STATUS_EVERY = 2.0
 STARTED = time.time()
 PROCS: dict[str, dict[str, Any]] = {}  # name -> pid, state, started, restarts, last_exit, last_exit_at, last_line
 TUNNEL: dict[str, str] = {}  # cloudflared connIndex -> edge location
+TUNNEL_IN_USE = {"protocol": ""}  # the protocol cloudflared was started with (status.json)
 RELAY_COUNTS: dict[str, Any] = {"passed": 0, "refused": 0, "unavailable": 0, "last": "", "last_at": 0.0}
 STATUS_LOCK = threading.Lock()
 
@@ -1322,7 +1348,7 @@ def write_status() -> None:
             "updated": time.time(),
             "launcher": {"pid": os.getpid(), "started": STARTED, "memory_mb": round(me.memory_info().rss / 1048576, 1)},
             "processes": procs,
-            "tunnel": {"connections": len(tunnel), "edges": sorted(tunnel.values())},
+            "tunnel": {"connections": len(tunnel), "edges": sorted(tunnel.values()), "protocol": TUNNEL_IN_USE["protocol"]},
             "relay": relay_counts,
             "access": access,
             "url": f"https://{tunnel_hosts()[0]}" if tunnel_hosts() else "",
@@ -1410,14 +1436,19 @@ def run() -> int:
     if dotenv().get("TUNNEL_TOKEN"):
         log("ignis/.env has a TUNNEL_TOKEN line: it is ignored; store the token with `set-token` and delete the line")
     token = tunnel_token()
+    protocol, why = tunnel_protocol(config("IGNIS_TUNNEL_PROTOCOL"))
+    if why:
+        log(why)
+        print(why, file=sys.stderr)
+        return 1
     if token:
         # The tunnel connector runs in the same container: its connection to Ignis stays inside it, and it dials out
-        # to Cloudflare. QUIC, because antivirus that re-signs TLS makes cloudflared reject the edge's certificate over
-        # HTTP/2. IPv4: IPv6 attempts timed out on the network it was tested on.
+        # to Cloudflare. IPv4: IPv6 attempts timed out on the network it was tested on.
         # https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/run-parameters/
+        log(f"cloudflared: protocol {protocol} (IGNIS_TUNNEL_PROTOCOL)")
+        TUNNEL_IN_USE["protocol"] = protocol
         workers.append(threading.Thread(target=supervise, daemon=True, args=(
-            "cloudflared", [str(CLOUDFLARED), "tunnel", "--no-autoupdate", "--protocol", "quic", "--edge-ip-version", "4", "run"],
-            {**env, "TUNNEL_TOKEN": token}, RUNTIME, job)))
+            "cloudflared", cloudflared_args(protocol), {**env, "TUNNEL_TOKEN": token}, RUNTIME, job)))
     else:
         log(f"no tunnel token in Credential Manager ({TOKEN_TARGET}): the tunnel is not started")
     # Augmented View: the relay outside the sandbox and the forwarder inside it (see "the Augmented View relay" above)

@@ -647,7 +647,7 @@ class IgnisTab extends PluginSettingTab {
           const r = s.relay;
           const cache = s.settings?.contentCacheBytes;
           const items = [
-            ["Tunnel", `${s.tunnel.connections} connection${s.tunnel.connections === 1 ? "" : "s"}${s.tunnel.edges.length ? ` (${s.tunnel.edges.join(", ")})` : ""}, QUIC over IPv4`],
+            ["Tunnel", `${s.tunnel.connections} connection${s.tunnel.connections === 1 ? "" : "s"}${s.tunnel.edges.length ? ` (${s.tunnel.edges.join(", ")})` : ""}, ${s.tunnel.protocol === "http2" ? "HTTP/2" : s.tunnel.protocol === "auto" ? "QUIC or HTTP/2 (auto)" : "QUIC"} over IPv4`],
             ["Augmented View relay", `${r.passed} passed, ${r.refused} refused, ${r.unavailable} while desktop's server was stopped${r.last ? `; last ${age(r.last_at)} ago` : ""}`],
             ["Vault access", !s.access?.checked_at ? "not checked yet"
               : `${s.access.lacking ? `${s.access.lacking} file(s) Ignis cannot open; ` : "every file open to Ignis; "}`

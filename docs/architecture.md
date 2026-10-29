@@ -58,7 +58,7 @@ LaTeX build) and the optional access watcher.
 | --- | --- | --- | --- |
 | Launcher | `launcher` | You | `pythonw.exe <root>\ignis\ignis_native.py run` |
 | Ignis server | `ignis` | AppContainer `ignis-control.ignis` | `runtime\node.exe app\apps\ignis-server\server\index.js` |
-| cloudflared | `cloudflared` | AppContainer `ignis-control.ignis` | `runtime\cloudflared.exe tunnel --no-autoupdate --protocol quic --edge-ip-version 4 run` |
+| cloudflared | `cloudflared` | AppContainer `ignis-control.ignis` | `runtime\cloudflared.exe tunnel --no-autoupdate --protocol <IGNIS_TUNNEL_PROTOCOL, default quic> --edge-ip-version 4 run` |
 | Augmented View forwarder | `augmented-view` | AppContainer `ignis-control.ignis` | `runtime\node.exe relay\augmented-view-forwarder.js 18790 \\.\pipe\ignis-control-ignis-augmented-view` |
 | Access watcher (optional) | none (shown under **Vault access**) | You | `ignis-launcher.exe access watch --vault <vault> --sid <SID> --exit-with-stdin` |
 | LaTeX build steps (on request) | none | AppContainer `ignis-control.latex` (biber: you) | See [Plugin-Integration/LaTeX.md](Plugin-Integration/LaTeX.md) |
@@ -175,7 +175,7 @@ never sees half a file.
 | `updated` | Time written (Unix seconds) |
 | `launcher` | `pid`, `started`, `memory_mb` |
 | `processes` | Per process (`ignis`, `cloudflared`, `augmented-view`): `state` (`starting`, `running`, `restarting`, `failed to start`), `pid`, `started`, `restarts`, `last_exit`, `last_exit_at`, `last_line`, and while running `cpu_percent` and `memory_mb` |
-| `tunnel` | `connections` (count), `edges` (Cloudflare locations), from cloudflared's `Registered tunnel connection` and `Connection terminated` lines |
+| `tunnel` | `protocol` (the one cloudflared was started with), `connections` (count), `edges` (Cloudflare locations), from cloudflared's `Registered tunnel connection` and `Connection terminated` lines |
 | `relay` | `passed`, `refused`, `unavailable` (counts for both pipes), `last`, `last_at` |
 | `access` | `checked_at`, `entries`, `lacking`, `repaired_total`, `repaired_last` (first 20), `errors` |
 | `url` | `https://<IGNIS_HOSTNAME>`, or empty |

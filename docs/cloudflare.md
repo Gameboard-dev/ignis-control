@@ -54,7 +54,7 @@ Complete these steps of [installation.md](installation.md) before the Cloudflare
 | --- | --- |
 | Python 3.9 or later with `pywin32` and `psutil` (needed by `set-token`) | [Prerequisites](installation.md#1-prerequisites) |
 | `cloudflared.exe` saved as `<root>\ignis\runtime\cloudflared.exe`, with no Windows service installed | [cloudflared](installation.md#cloudflared) |
-| Outbound UDP port 7844 over IPv4 allowed (the launcher runs cloudflared with `--protocol quic --edge-ip-version 4`) | [cloudflared](installation.md#cloudflared) |
+| Outbound UDP port 7844 over IPv4 allowed (the launcher runs cloudflared with `--protocol quic --edge-ip-version 4`; with `IGNIS_TUNNEL_PROTOCOL=http2`, TCP port 7844 instead) | [cloudflared](installation.md#cloudflared) |
 | The antivirus root certificate, only if your antivirus scans HTTPS | [HTTPS-scanning antivirus](installation.md#https-scanning-antivirus) |
 | TinyTeX, only for the LaTeX build | [TinyTeX](installation.md#tinytex) |
 | The installation folder, the built Ignis and `setup` | [Steps 2–6](installation.md#2-the-installation-folder) |

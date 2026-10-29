@@ -65,7 +65,7 @@ to do:
 
 | Who | Connects to | What goes through | Why |
 | --- | --- | --- | --- |
-| cloudflared (in the sandbox) | Cloudflare's edge, outbound, QUIC on UDP port 7844 | Every page, file and request between a browser and your Ignis server, after Cloudflare Access has admitted the browser | The tunnel publishes Ignis without opening a port on your PC. Cloudflare terminates TLS, so Cloudflare can see this traffic ([security.md](security.md#what-is-not-protected)) |
+| cloudflared (in the sandbox) | Cloudflare's edge, outbound, QUIC on UDP port 7844 (or HTTP/2 on TCP port 7844 with `IGNIS_TUNNEL_PROTOCOL`) | Every page, file and request between a browser and your Ignis server, after Cloudflare Access has admitted the browser | The tunnel publishes Ignis without opening a port on your PC. Cloudflare terminates TLS, so Cloudflare can see this traffic ([security.md](security.md#what-is-not-protected)) |
 | Ignis (in the sandbox) | The addresses Obsidian plugins in the browser ask Ignis's proxy for | Those plugins' own requests | Ignis's proxy stands in for desktop Obsidian's network access; this is Ignis's behaviour, not Ignis Control's |
 | The launcher | `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` | Nothing is sent; Cloudflare's public signing keys are fetched (at most once an hour) | Only when the LaTeX build is set up and a build request arrives: to check the request's Cloudflare Access token before building |
 | The launcher's relay | `127.0.0.1:<port>` on your own PC | Only the listed requests of a relayed service (Augmented View's model server) | Lets that plugin, in a browser, use the server desktop Obsidian runs ([relay.md](relay.md)) |

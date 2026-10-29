@@ -72,6 +72,7 @@ A line in `.env` is the simplest; for a **user** environment variable, which the
 | `IGNIS_CONTAINER_PREFIX` | `ignis-control` | The prefix of every name the installation uses in Windows ([Names in Windows](#names-in-windows)). Letters, digits, `.` and `-`, at most 40 characters; anything else stops the launcher with the reason. Changing it on an installation means a new sandbox: run `setup` and `set-token` again |
 | `IGNIS_EXTRA_CA_CERT` | `<root>\ignis\runtime\extra-ca.pem` | An extra root certificate (PEM) for Ignis's Node, passed as `NODE_EXTRA_CA_CERTS` when the file exists ([installation.md](installation.md#https-scanning-antivirus)). The sandbox must be able to read it, so keep it in `runtime\` |
 | `IGNIS_LAUNCHER_EXE` | `<root>\ignis\ignis-launcher.exe` | The Rust access watcher. If the file does not exist, the launcher scans the vault every 300 s instead |
+| `IGNIS_TUNNEL_PROTOCOL` | `quic` | cloudflared's transport to Cloudflare's edge, passed as `--protocol`: `quic` (UDP 7844), `http2` (TLS over TCP 7844, for networks that block or disturb UDP) or `auto` (cloudflared's own choice: QUIC, falling back to HTTP/2). Anything else stops the launcher with the reason in `ignis.log`. `http2` fails behind antivirus that re-signs TLS unless `cloudflared.exe` or `*.argotunnel.com` is excluded from its HTTPS scanning ([troubleshooting.md](troubleshooting.md#the-tunnel)). Read at launcher start |
 | `IGNIS_TINYTEX` | `%APPDATA%\TinyTeX` | The TinyTeX folder for the LaTeX build (its programs are in `bin\windows\`) |
 | `APPDATA` | set by Windows | The default TinyTeX folder; the logon shortcut goes to `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` |
 | `LOCALAPPDATA` | set by Windows | `location.json` is written to `%LOCALAPPDATA%\Ignis Control\` |
@@ -109,7 +110,8 @@ documented at [ignis.thiefling.com/docs/server/environment](https://ignis.thiefl
 
 ## What the launcher passes to cloudflared
 
-- Command: `<root>\ignis\runtime\cloudflared.exe tunnel --no-autoupdate --protocol quic --edge-ip-version 4 run`,
+- Command: `<root>\ignis\runtime\cloudflared.exe tunnel --no-autoupdate --protocol <protocol> --edge-ip-version 4 run`,
+  where `<protocol>` is `IGNIS_TUNNEL_PROTOCOL` (default `quic`); the log says `cloudflared: protocol <protocol>` at start,
   working folder `<root>\ignis\runtime`.
 - Environment: the same as Ignis, plus `TUNNEL_TOKEN` read from Credential Manager.
 - cloudflared is started only when a token is stored. Otherwise the log says

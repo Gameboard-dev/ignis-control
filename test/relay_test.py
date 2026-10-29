@@ -259,6 +259,25 @@ def powershell_values() -> None:
     assert code == 0 and out.getvalue().strip() == hostile, out.getvalue()
 
 
+def tunnel() -> None:
+    """IGNIS_TUNNEL_PROTOCOL: quic by default, http2 or auto when set, anything else refused; always one argument."""
+    assert n.tunnel_protocol(None) == ("quic", "") and n.tunnel_protocol("") == ("quic", "")
+    for value, want in (("quic", "quic"), ("http2", "http2"), ("auto", "auto"), (" HTTP2 ", "http2")):
+        assert n.tunnel_protocol(value) == (want, ""), value
+    for bad in ("h2", "http2 --loglevel debug", "quic;calc", "tcp", "--protocol", "http2\nquic"):
+        proto, why = n.tunnel_protocol(bad)
+        assert proto == "" and "IGNIS_TUNNEL_PROTOCOL" in why, bad
+    args = n.cloudflared_args("http2")
+    assert args[args.index("--protocol") + 1] == "http2" and args.count("--protocol") == 1
+    assert args[1:] == ["tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "run"]
+    try:
+        n.cloudflared_args("http2 --loglevel debug")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("cloudflared_args took an unchecked protocol")
+
+
 def main() -> None:
     n.log = lambda *a, **k: None  # type: ignore[assignment]
     os.environ.pop("IGNIS_AUGMENTED_VIEW_PORT", None)
@@ -269,6 +288,7 @@ def main() -> None:
         settings(tmp)
         names()
         powershell_values()
+        tunnel()
         routes()
         ignored_paths()
         vault_cannot_redirect(tmp)

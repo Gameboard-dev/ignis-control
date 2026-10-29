@@ -79,8 +79,9 @@ git -C <repo> checkout <version>
 cloudflared does not update itself on Windows. To update it, replace `<root>\ignis\runtime\cloudflared.exe` and
 restart the launcher.
 
-The launcher runs cloudflared with `--protocol quic --edge-ip-version 4`. The PC must be allowed to connect out on
-UDP port 7844 over IPv4
+The launcher runs cloudflared with `--protocol quic --edge-ip-version 4` (`IGNIS_TUNNEL_PROTOCOL` chooses `http2`
+or `auto` instead; [configuration.md](configuration.md#environment-variables)). The PC must be allowed to connect out on
+UDP port 7844 (TCP port 7844 for `http2`) over IPv4
 ([firewall requirements](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/)).
 
 ### TinyTeX
