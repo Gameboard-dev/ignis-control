@@ -1,0 +1,196 @@
+diff --git a/apps/ignis-server/server/index.js b/apps/ignis-server/server/index.js
+--- a/apps/ignis-server/server/index.js
++++ b/apps/ignis-server/server/index.js
+@@ -56,6 +56,9 @@
+   next();
+ });
+ 
++// local patch 0006: the relay to services on this computer, before the body parsers and compression (it streams)
++app.use("/relay", require("./routes/local-relay").localRelay({ originAllowlist: settings.get("wsOrigins") }));
++
+ app.use(express.json({ limit: settings.MAX_BODY_BACKSTOP }));
+ app.use(compression());
+ 
+diff --git a/apps/ignis-server/server/routes/local-relay.js b/apps/ignis-server/server/routes/local-relay.js
+new file mode 100644
+--- /dev/null
++++ b/apps/ignis-server/server/routes/local-relay.js
+@@ -0,0 +1,79 @@
++// local patch 0006: the same-origin relay to services on the computer that runs Ignis.
++//
++// A plugin in the browser asks `<this page's origin>/relay/<service>/<path>`; this route streams the request, and the
++// answer (server-sent events too), through the named pipe the launcher (ignis/ignis_native.py) serves outside the
++// sandbox, whose name it passes in IGNIS_LOCAL_RELAY. The launcher decides, per service, which requests may pass and
++// which local port answers them (ignis/SETUP.md, "The relay"); this side only checks the form of the request.
++// Same origin: no CORS, and Cloudflare Access's session covers it. A cross-site page cannot use it: a request with an
++// Origin header must come from this host or from WS_ORIGINS. Cookies and credentials are not forwarded.
++
++const http = require("http");
++
++const SERVICE = /^[a-z][a-z0-9-]{0,31}$/;
++// headers a local service needs; everything else (cookies, Cloudflare Access's tokens, forwarding headers) stays here
++const FORWARDED = new Set(["accept", "accept-language", "content-type", "content-length", "last-event-id", "cache-control", "user-agent"]);
++// the LaTeX build alone gets Cloudflare Access's token, which the launcher verifies before it builds (2026-10-28)
++const TOKEN_FOR = new Set(["latex"]);
++
++function forwardedHeaders(headers, service = "") {
++  const out = {};
++  for (const [k, v] of Object.entries(headers || {})) {
++    const key = k.toLowerCase();
++    if (FORWARDED.has(key) || (key === "cf-access-jwt-assertion" && TOKEN_FOR.has(service))) out[key] = v;
++  }
++  out.host = "relay";
++  out.connection = "close";
++  return out;
++}
++
++// Whether the request came from this page (no Origin: a same-origin GET, or not a browser) or an allowed origin.
++function originAllowed(req, allowlist) {
++  const origin = req.headers.origin;
++  if (!origin) return true;
++  try {
++    if (new URL(origin).host === req.headers.host) return true;
++  } catch {
++    return false;
++  }
++  return (allowlist || []).includes(origin);
++}
++
++function localRelay({ pipe = process.env.IGNIS_LOCAL_RELAY || "", originAllowlist = [] } = {}) {
++  return (req, res) => {
++    // req.url is relative to the mount point: "/example/health?x=1"
++    const [first, ...rest] = req.url.replace(/^\/+/, "").split("/");
++    const service = first || "";
++    if (!SERVICE.test(service)) {
++      return res.status(404).json({ error: "no such relay service" });
++    }
++    if (!originAllowed(req, originAllowlist)) {
++      console.warn(`relay: refused ${req.method} /relay/${service}: origin ${req.headers.origin}`);
++      return res.status(403).json({ error: "the relay serves only this page" });
++    }
++    if (!pipe) {
++      return res.status(503).json({ error: "the relay is off: the launcher did not set IGNIS_LOCAL_RELAY" });
++    }
++    const upstream = http.request(
++      { socketPath: pipe, method: req.method, path: `/${service}/${rest.join("/")}`, headers: forwardedHeaders(req.headers, service), agent: false },
++      (up) => {
++        const headers = { ...up.headers };
++        delete headers.connection;
++        res.writeHead(up.statusCode || 502, headers);
++        if (typeof res.flushHeaders === "function") res.flushHeaders(); // an event stream starts at once
++        up.pipe(res);
++      },
++    );
++    upstream.on("error", (e) => {
++      if (!res.headersSent) {
++        res.status(502).json({ error: `the relay is not running (${e.code || e.message}): is the launcher up?` });
++      } else {
++        res.end();
++      }
++    });
++    // the page went away (an EventSource closed): stop the request on the other side too
++    res.on("close", () => upstream.destroy());
++    req.pipe(upstream);
++  };
++}
++
++module.exports = { localRelay, forwardedHeaders, originAllowed };
+diff --git a/apps/ignis-server/server/routes/local-relay.test.mjs b/apps/ignis-server/server/routes/local-relay.test.mjs
+new file mode 100644
+--- /dev/null
++++ b/apps/ignis-server/server/routes/local-relay.test.mjs
+@@ -0,0 +1,94 @@
++import { describe, it, expect, afterEach } from "vitest";
++import { createRequire } from "module";
++import http from "node:http";
++
++const require = createRequire(import.meta.url);
++const express = require("express");
++const { localRelay, forwardedHeaders } = require("./local-relay.js");
++
++const servers = [];
++afterEach(() => {
++  for (const s of servers.splice(0)) s.close();
++});
++
++function listen(server, at) {
++  servers.push(server);
++  return new Promise((resolve) => server.listen(at, resolve));
++}
++
++// the launcher's side: an HTTP server on a named pipe (a Unix socket elsewhere), recording what it was sent
++async function fakeLauncher(handler) {
++  const pipe = process.platform === "win32" ? `\\\\.\\pipe\\ignis-relay-test-${process.pid}-${Math.random().toString(36).slice(2)}` : `/tmp/ignis-relay-test-${process.pid}-${Date.now()}.sock`;
++  const seen = [];
++  await listen(http.createServer((req, res) => {
++    let body = "";
++    req.on("data", (c) => (body += c));
++    req.on("end", () => {
++      seen.push({ method: req.method, url: req.url, headers: req.headers, body });
++      handler(req, res);
++    });
++  }), pipe);
++  return { pipe, seen };
++}
++
++async function ignis(pipe) {
++  const app = express();
++  app.use("/relay", localRelay({ pipe, originAllowlist: ["https://allowed.example"] }));
++  const server = http.createServer(app);
++  await listen(server, 0);
++  return `http://127.0.0.1:${server.address().port}`;
++}
++
++describe("local relay", () => {
++  it("passes a request and its body through the pipe, without cookies", async () => {
++    const { pipe, seen } = await fakeLauncher((req, res) => {
++      res.writeHead(200, { "content-type": "application/json" });
++      res.end('{"ok":true}');
++    });
++    const base = await ignis(pipe);
++    const r = await fetch(`${base}/relay/example/search?x=1`, { method: "POST", headers: { "content-type": "application/json", cookie: "CF_Authorization=secret" }, body: '{"q":"a"}' });
++    expect(r.status).toBe(200);
++    expect(await r.json()).toEqual({ ok: true });
++    expect(seen[0].method).toBe("POST");
++    expect(seen[0].url).toBe("/example/search?x=1");
++    expect(seen[0].body).toBe('{"q":"a"}');
++    expect(seen[0].headers.cookie).toBeUndefined();
++  });
++
++  it("streams an event stream as it comes", async () => {
++    const { pipe } = await fakeLauncher((req, res) => {
++      res.writeHead(200, { "content-type": "text/event-stream" });
++      res.write("data: one\n\n");
++      setTimeout(() => res.end("data: two\n\n"), 200);
++    });
++    const base = await ignis(pipe);
++    const r = await fetch(`${base}/relay/example/events`);
++    const reader = r.body.getReader();
++    const first = new TextDecoder().decode((await reader.read()).value);
++    expect(first).toBe("data: one\n\n"); // before the second part was written
++    await reader.cancel();
++  });
++
++  it("refuses another site, a bad service name, and says when the relay is off", async () => {
++    const { pipe, seen } = await fakeLauncher((req, res) => res.end("x"));
++    const base = await ignis(pipe);
++    expect((await fetch(`${base}/relay/example/health`, { headers: { origin: "https://evil.example" } })).status).toBe(403);
++    expect((await fetch(`${base}/relay/example/health`, { headers: { origin: "https://allowed.example" } })).status).toBe(200);
++    expect((await fetch(`${base}/relay/..%2F/health`)).status).toBe(404);
++    expect((await fetch(`${base}/relay/UPPER/health`)).status).toBe(404);
++    expect(seen.length).toBe(1);
++    const off = await ignis("");
++    expect((await fetch(`${off}/relay/example/health`)).status).toBe(503);
++  });
++
++  it("says so when nothing serves the pipe", async () => {
++    const base = await ignis(process.platform === "win32" ? "\\\\.\\pipe\\ignis-relay-test-nobody" : "/tmp/ignis-relay-test-nobody.sock");
++    const r = await fetch(`${base}/relay/example/health`);
++    expect(r.status).toBe(502);
++    expect((await r.json()).error).toMatch(/relay is not running/);
++  });
++
++  it("forwards only the headers a service needs", () => {
++    expect(forwardedHeaders({ Cookie: "a", Authorization: "b", "cf-access-jwt-assertion": "c", "Content-Type": "x", "Last-Event-ID": "4" })).toEqual({ "content-type": "x", "last-event-id": "4", host: "relay", connection: "close" });
++  });
++});

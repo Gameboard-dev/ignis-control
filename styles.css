@@ -1,0 +1,141 @@
+/* Ignis Control: status bar indicator and the settings panel */
+.ignis-control-bar[data-level="ok"] { color: var(--color-green); }
+.ignis-control-bar[data-level="warn"] { color: var(--color-orange); }
+.ignis-control-bar[data-level="bad"] { color: var(--color-red); }
+.ignis-control-bar[data-level="off"] { color: var(--text-muted); }
+
+.ignis-control .ignis-platform {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: var(--size-4-3);
+}
+
+/* Status */
+.ignis-control .ignis-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-3);
+  padding-bottom: var(--size-4-4);
+}
+.ignis-control .ignis-headline { font-size: var(--font-ui-medium); font-weight: var(--font-medium); }
+.ignis-control .ignis-url { margin-left: var(--size-4-3); font-weight: normal; font-size: var(--font-ui-small); }
+.ignis-control .ignis-dot.ignis-ok { color: var(--color-green); }
+.ignis-control .ignis-dot.ignis-warn { color: var(--color-orange); }
+.ignis-control .ignis-dot.ignis-bad { color: var(--color-red); }
+.ignis-control .ignis-dot.ignis-off { color: var(--text-muted); }
+.ignis-control .ignis-down { color: var(--text-muted); margin: 0; }
+
+.ignis-control .ignis-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-ui-small);
+  font-variant-numeric: tabular-nums;
+}
+.ignis-control .ignis-table th {
+  text-align: left;
+  font-weight: var(--font-medium);
+  color: var(--text-muted);
+  padding: var(--size-2-2) var(--size-4-3) var(--size-2-2) 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.ignis-control .ignis-table td {
+  padding: var(--size-2-2) var(--size-4-3) var(--size-2-2) 0;
+  border-bottom: 1px solid var(--background-modifier-border-hover);
+}
+
+.ignis-control .ignis-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--size-2-2) var(--size-4-6);
+  font-size: var(--font-ui-small);
+}
+.ignis-control .ignis-fact-key { color: var(--text-muted); }
+
+.ignis-control .ignis-log-box summary {
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-3);
+}
+
+.ignis-log {
+  font-size: var(--font-ui-smaller);
+  height: 18em;          /* fixed, so updates never move the page */
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--background-secondary);
+  padding: var(--size-4-2);
+  border-radius: var(--radius-s);
+  margin-top: var(--size-4-2);
+  user-select: text;
+}
+
+/* Values shown beside sliders */
+.ignis-control .ignis-value {
+  min-width: 9em;
+  text-align: right;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Resources and guide */
+.ignis-control .ignis-group {
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin: var(--size-4-5) 0 var(--size-2-2);
+}
+.ignis-control .ignis-resource,
+.ignis-control .ignis-guide { padding: var(--size-4-2) 0; }
+.ignis-control .ignis-guide .setting-item-description { max-width: 60em; line-height: var(--line-height-normal); }
+.ignis-check-result { margin-top: var(--size-2-2); }
+.ignis-check-result.mod-success { color: var(--text-success); }
+.ignis-check-result.mod-warning { color: var(--text-error); }
+
+/* Plugin exclusions: a search box with its matches below, then the excluded plugins */
+.ignis-plugin-search { display: flex; flex-direction: column; gap: var(--size-2-1); min-width: 220px; }
+.ignis-plugin-hits { display: flex; flex-direction: column; }
+.ignis-plugin-hit { padding: var(--size-2-1) var(--size-2-3); border-radius: var(--radius-s); cursor: pointer; }
+.ignis-plugin-hit:hover { background: var(--background-modifier-hover); }
+.ignis-plugin-none { color: var(--text-muted); font-size: var(--font-ui-smaller); padding: var(--size-2-1) var(--size-2-3); }
+
+/* the excluded plugins in a box of their own */
+.ignis-exclusions { margin-bottom: var(--size-4-4); max-height: 260px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); padding: var(--size-2-2) var(--size-4-3); background: var(--background-secondary); }
+.ignis-exclusions .setting-item:first-child { border-top: none; }
+
+/* The settings tab's contents (scoped to this plugin's tab): a column of links to the left of the settings that
+   stays in view as they scroll, where the window is wide enough; above the settings, in a line, where it is not. */
+.ignis-control .setting-contents { margin-bottom: var(--size-4-4); font-size: var(--font-ui-small); }
+.ignis-control .setting-contents-title { font-weight: var(--font-semibold); margin-bottom: var(--size-2-2); }
+@media (min-width: 1000px) {
+  body:not(.is-mobile) .ignis-control.setting-contents-layout {
+    display: grid;
+    grid-template-columns: 11rem minmax(0, 1fr);
+    gap: 0 var(--size-4-6); /* not column-gap: the directory's CSS lint reads it as multi-column layout */
+    align-items: start;
+    grid-auto-rows: max-content; /* a scrolling box keeps its height (the tab has a fixed height) */
+  }
+  body:not(.is-mobile) .ignis-control.setting-contents-layout > * { grid-column: 2; }
+  body:not(.is-mobile) .ignis-control.setting-contents-layout > .setting-contents {
+    grid-column: 1;
+    grid-row: 1 / span 999;
+    position: sticky;
+    top: 0;
+    max-height: calc(100vh - 12rem);
+    overflow-y: auto;
+    margin-bottom: 0;
+    padding-right: var(--size-4-2);
+    border-right: 1px solid var(--background-modifier-border);
+  }
+  body:not(.is-mobile) .ignis-control.setting-contents-layout .setting-contents-links a {
+    display: block;
+    padding: var(--size-2-1) 0;
+  }
+  body:not(.is-mobile) .ignis-control.setting-contents-layout .setting-contents-sep { display: none; }
+}

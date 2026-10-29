@@ -1,0 +1,771 @@
+diff --git a/packages/shim/src/loader.js b/packages/shim/src/loader.js
+index c7ac1e8..59a3938 100644
+--- a/packages/shim/src/loader.js
++++ b/packages/shim/src/loader.js
+@@ -18,6 +18,7 @@ import {
+ import { wsClient } from "./ws-client.js";
+ import { installIgnisApi } from "./ignis-api.js";
+ import { installDiagnostics } from "./diagnostics.js";
++import { requestPersistentStorage } from "./persistent-storage.js";
+ import {
+   getState,
+   onStateChange,
+@@ -34,6 +35,7 @@ window.__ignis = { version: __IGNIS_VERSION__, build: __IGNIS_BUILD__ };
+ window.__ignis_registerUI = registerUI;
+ 
+ installDiagnostics(); // local patch 0003: errors, plugin load times, stalls, memory and crashes to the server's log
++requestPersistentStorage(); // local patch 0004: keep the note index from being cleared on phones
+ 
+ installIgnisApi(wsClient, {
+   getState,
+diff --git a/packages/shim/src/init.js b/packages/shim/src/init.js
+index 50f97ab..de4a256 100644
+--- a/packages/shim/src/init.js
++++ b/packages/shim/src/init.js
+@@ -18,6 +18,7 @@ import { initSpellcheckGuard } from "./guards/spellcheck-guard.js";
+ import { initPopoutGuard } from "./guards/popout-guard.js";
+ import { initLocalPluginsGuard } from "./guards/local-plugins-guard.js";
+ import { applyDiagnosticsSetting } from "./diagnostics.js";
++import { persistentCache } from "./fs/persistent-cache.js";
+ 
+ let bootstrapVirtualPlugins = [];
+ 
+@@ -33,6 +34,9 @@ function applyServerSettings(s) {
+     fsShim._contentCache.setMaxSize(s.contentCacheBytes);
+   }
+ 
++  // Local patch 0004: the size of the .obsidian files this browser keeps between visits
++  persistentCache.configure({ capBytes: s.persistentCacheBytes, vaultId: window.__currentVaultId || "" });
++
+   setInputCacheLimits({ maxSize: s.inputCacheBytes, ttlMs: s.inputCacheTtlMs });
+   setDirectFetchHosts(s.directFetchHosts);
+ 
+diff --git a/packages/shim/src/persistent-storage.js b/packages/shim/src/persistent-storage.js
+new file mode 100644
+index 0000000..9b33ec1
+--- /dev/null
++++ b/packages/shim/src/persistent-storage.js
+@@ -0,0 +1,50 @@
++// Local patch (Ignis Control, 2026-10-27; patches/0004-mobile.patch): ask the browser to keep this site's storage.
++// Obsidian keeps its metadata index (headings, blocks, links of every note) in IndexedDB, built once per device; a
++// phone's browser may clear "best-effort" storage when space runs low, and the next visit would index the whole vault
++// again. A persisted origin is cleared only by the user. Chrome decides by itself (site engagement, a bookmark, an
++// installed app) and answers at once, without a prompt; Firefox may ask. The answer goes to the tab report.
++// https://developer.mozilla.org/en-US/docs/Web/API/StorageManager/persist
++
++import { report } from "./diagnostics.js";
++import { persistentCache } from "./fs/persistent-cache.js";
++
++const mb = (b) => (Number.isFinite(b) ? `${(b / 1048576).toFixed(1)} MB` : "?");
++
++// What the kept .obsidian files saved this visit (fs/persistent-cache.js), 30 s after start: by then the plugins have
++// loaded and read their files.
++function reportPersistentCache() {
++  const s = persistentCache.stats;
++
++  if (!persistentCache.capBytes) {
++    report("cache", "info", "kept plugin and settings files: off (persistentCacheBytes is 0)");
++  } else if (s.error) {
++    report("cache", "warn", `kept plugin and settings files: not used this visit (${s.error})`);
++  } else {
++    report("cache", "info", `kept plugin and settings files: ${s.hits} taken from this browser (${mb(s.hitBytes)} not downloaded),`
++      + ` ${s.stored} downloaded and kept (${mb(s.storedBytes)}), ${s.evicted} dropped to stay under the cap,`
++      + ` ${s.skipped} too large to keep; ${mb(persistentCache.totalBytes)} kept of ${mb(persistentCache.capBytes)}`);
++  }
++}
++
++export async function requestPersistentStorage() {
++  setTimeout(reportPersistentCache, 30000);
++  const storage = navigator.storage;
++
++  if (!storage?.persist || !storage.persisted) {
++    report("storage", "warn", "this browser cannot be asked to keep the site's storage: the note index may be cleared");
++    return;
++  }
++
++  try {
++    const already = await storage.persisted();
++    const granted = already || (await storage.persist());
++    const { usage, quota } = storage.estimate ? await storage.estimate() : {};
++
++    report("storage", granted ? "info" : "warn", granted
++      ? `site storage is kept (${already ? "already" : "granted now"}); ${mb(usage)} used of ${mb(quota)}`
++      : `the browser did not agree to keep the site's storage (it decides by use, a bookmark or an installed app);`
++        + ` the note index may be cleared when space runs low; ${mb(usage)} used of ${mb(quota)}`);
++  } catch (e) {
++    report("storage", "warn", `asking to keep the site's storage failed: ${e?.message || e}`);
++  }
++}
+diff --git a/packages/shim/src/fs/persistent-cache.js b/packages/shim/src/fs/persistent-cache.js
+new file mode 100644
+index 0000000..b3b73bd
+--- /dev/null
++++ b/packages/shim/src/fs/persistent-cache.js
+@@ -0,0 +1,323 @@
++// Local patch (Ignis Control, 2026-10-27; patches/0004-mobile.patch): files under .obsidian/ (settings, plugins'
++// code, styles and WebAssembly) kept in the browser between visits, so a phone does not download them again at every
++// start (18.9 MB for 21 plugins on 2026-10-27, 12.1 MB of it TikZJax). A kept copy is used only while the file's
++// modification time and size, from the vault listing Ignis sends at each start, still match; any change on the
++// server fetches the file again and replaces the copy. Notes are not kept here (Obsidian keeps its own index).
++//
++// Size: at most `capBytes` in all (the server setting persistentCacheBytes, set in Ignis Control; 0 turns it off and
++// empties it); the least recently used files are dropped first, and a single file over a quarter of the cap is not
++// kept. Sizes are counted as stored: a string by its length, binary by its bytes.
++//
++// Storage: IndexedDB ("ignis-persistent-files": "meta" holds each file's validator, size and last use, small enough to
++// load whole at start; "data" holds the contents, read one at a time). The backend is an interface so the logic is
++// tested without a browser (persistent-cache.test.js).
++// https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API
++
++import { normalize } from "../util/path.js";
++
++export const DEFAULT_CAP_BYTES = 100 * 1024 * 1024;
++const MAX_FILE_FRACTION = 0.25;
++const TOUCH_DELAY_MS = 2000;
++
++export function isPersistable(path) {
++  return normalize(path).startsWith(".obsidian/");
++}
++
++function byteLength(data) {
++  if (typeof data === "string") {
++    return data.length;
++  }
++
++  return data?.byteLength ?? 0;
++}
++
++export class PersistentCache {
++  constructor(backend, { capBytes = DEFAULT_CAP_BYTES } = {}) {
++    this._backend = backend;
++    this._cap = capBytes;
++    this._vault = "";
++    this._index = new Map(); // key -> { mtime, size, bytes, usedAt }
++    this._total = 0;
++    this._ready = null;
++    this._touched = new Set();
++    this._touchTimer = null;
++    this.stats = { hits: 0, hitBytes: 0, misses: 0, stored: 0, storedBytes: 0, evicted: 0, skipped: 0, error: "" };
++  }
++
++  configure({ capBytes, vaultId } = {}) {
++    if (Number.isFinite(capBytes) && capBytes >= 0) {
++      this._cap = capBytes;
++    }
++
++    if (typeof vaultId === "string") {
++      this._vault = vaultId;
++    }
++  }
++
++  get enabled() {
++    return this._cap > 0 && !this.stats.error;
++  }
++
++  get totalBytes() {
++    return this._total;
++  }
++
++  get capBytes() {
++    return this._cap;
++  }
++
++  _key(path) {
++    return `${this._vault}\n${normalize(path)}`;
++  }
++
++  // Load the index (once); with the cap at 0, empty the store instead.
++  ready() {
++    if (!this._ready) {
++      this._ready = (async () => {
++        try {
++          await this._backend.open();
++
++          if (this._cap === 0) {
++            await this._backend.clear();
++            return;
++          }
++
++          for (const [key, meta] of await this._backend.loadMeta()) {
++            this._index.set(key, meta);
++            this._total += meta.bytes || 0;
++          }
++
++          await this._fitWithin(this._cap); // the cap may have been lowered since the last visit
++        } catch (e) {
++          this.stats.error = e?.message || String(e);
++        }
++      })();
++    }
++
++    return this._ready;
++  }
++
++  // The kept copy of `path`, if its modification time and size still match `meta` ({ mtime, size }); else null.
++  async get(path, meta) {
++    if (!this.enabled || !isPersistable(path) || !meta) {
++      return null;
++    }
++
++    await this.ready();
++
++    const key = this._key(path);
++    const kept = this._index.get(key);
++
++    if (!kept) {
++      this.stats.misses++;
++      return null;
++    }
++
++    if (kept.mtime !== meta.mtime || kept.size !== meta.size) {
++      this.stats.misses++;
++      await this._drop([key]);
++      return null;
++    }
++
++    let data = null;
++
++    try {
++      data = await this._backend.getData(key);
++    } catch {
++      data = null;
++    }
++
++    if (data === null || data === undefined) {
++      this.stats.misses++;
++      await this._drop([key]);
++      return null;
++    }
++
++    kept.usedAt = Date.now();
++    this._touch(key);
++    this.stats.hits++;
++    this.stats.hitBytes += kept.bytes;
++
++    return data;
++  }
++
++  // Keep `data`, read from the server when the file had `meta` ({ mtime, size }).
++  async put(path, meta, data) {
++    if (!this.enabled || !isPersistable(path) || !meta || data === null || data === undefined) {
++      return;
++    }
++
++    await this.ready();
++
++    const bytes = byteLength(data);
++
++    if (bytes > this._cap * MAX_FILE_FRACTION) {
++      this.stats.skipped++;
++      return;
++    }
++
++    const key = this._key(path);
++
++    if (this._index.has(key)) {
++      await this._drop([key]);
++    }
++
++    await this._fitWithin(this._cap - bytes);
++
++    const entry = { mtime: meta.mtime, size: meta.size, bytes, usedAt: Date.now() };
++
++    try {
++      await this._backend.put(key, entry, data);
++      this._index.set(key, entry);
++      this._total += bytes;
++      this.stats.stored++;
++      this.stats.storedBytes += bytes;
++    } catch (e) {
++      // Quota exceeded or storage gone: stop using it for this visit
++      this.stats.error = e?.message || String(e);
++    }
++  }
++
++  // Drop the least recently used entries until the total is at most `limit`.
++  async _fitWithin(limit) {
++    if (this._total <= limit) {
++      return;
++    }
++
++    const oldest = [...this._index.entries()].sort((a, b) => a[1].usedAt - b[1].usedAt);
++    const drop = [];
++    let total = this._total;
++
++    for (const [key, meta] of oldest) {
++      if (total <= limit) {
++        break;
++      }
++
++      drop.push(key);
++      total -= meta.bytes || 0;
++    }
++
++    this.stats.evicted += drop.length;
++    await this._drop(drop);
++  }
++
++  async _drop(keys) {
++    for (const key of keys) {
++      const meta = this._index.get(key);
++
++      if (meta) {
++        this._total -= meta.bytes || 0;
++        this._index.delete(key);
++      }
++
++      this._touched.delete(key);
++    }
++
++    if (keys.length) {
++      try {
++        await this._backend.delete(keys);
++      } catch {
++        // gone already
++      }
++    }
++  }
++
++  // Last-use times are written in batches, not on every read
++  _touch(key) {
++    this._touched.add(key);
++
++    if (!this._touchTimer) {
++      this._touchTimer = setTimeout(() => {
++        this._touchTimer = null;
++        const entries = [...this._touched].filter((k) => this._index.has(k)).map((k) => [k, this._index.get(k)]);
++        this._touched.clear();
++        this._backend.putMeta(entries).catch(() => {});
++      }, TOUCH_DELAY_MS);
++    }
++  }
++}
++
++// --- the IndexedDB backend ---
++
++function request(r) {
++  return new Promise((resolve, reject) => {
++    r.onsuccess = () => resolve(r.result);
++    r.onerror = () => reject(r.error);
++  });
++}
++
++function done(tx) {
++  return new Promise((resolve, reject) => {
++    tx.oncomplete = () => resolve();
++    tx.onerror = () => reject(tx.error);
++    tx.onabort = () => reject(tx.error || new Error("transaction aborted"));
++  });
++}
++
++export function indexedDbBackend(name = "ignis-persistent-files") {
++  let db = null;
++  const tx = (stores, mode) => db.transaction(stores, mode, { durability: "relaxed" });
++
++  return {
++    async open() {
++      if (typeof indexedDB === "undefined") {
++        throw new Error("no IndexedDB in this browser");
++      }
++
++      const open = indexedDB.open(name, 1);
++      open.onupgradeneeded = () => {
++        open.result.createObjectStore("meta");
++        open.result.createObjectStore("data");
++      };
++      db = await request(open);
++    },
++
++    async loadMeta() {
++      const store = tx(["meta"], "readonly").objectStore("meta");
++      const [keys, values] = await Promise.all([request(store.getAllKeys()), request(store.getAll())]);
++
++      return keys.map((k, i) => [k, values[i]]);
++    },
++
++    async getData(key) {
++      return request(tx(["data"], "readonly").objectStore("data").get(key));
++    },
++
++    async put(key, meta, data) {
++      const t = tx(["meta", "data"], "readwrite");
++      t.objectStore("data").put(data, key);
++      t.objectStore("meta").put(meta, key);
++      await done(t);
++    },
++
++    async putMeta(entries) {
++      const t = tx(["meta"], "readwrite");
++
++      for (const [key, meta] of entries) {
++        t.objectStore("meta").put(meta, key);
++      }
++
++      await done(t);
++    },
++
++    async delete(keys) {
++      const t = tx(["meta", "data"], "readwrite");
++
++      for (const key of keys) {
++        t.objectStore("meta").delete(key);
++        t.objectStore("data").delete(key);
++      }
++
++      await done(t);
++    },
++
++    async clear() {
++      const t = tx(["meta", "data"], "readwrite");
++      t.objectStore("meta").clear();
++      t.objectStore("data").clear();
++      await done(t);
++    },
++  };
++}
++
++export const persistentCache = new PersistentCache(indexedDbBackend());
+diff --git a/packages/shim/src/fs/persistent-cache.test.js b/packages/shim/src/fs/persistent-cache.test.js
+new file mode 100644
+index 0000000..fef6f89
+--- /dev/null
++++ b/packages/shim/src/fs/persistent-cache.test.js
+@@ -0,0 +1,141 @@
++import { describe, it, expect, vi } from "vitest";
++import { PersistentCache, isPersistable } from "./persistent-cache.js";
++
++// The IndexedDB backend's interface, in memory
++function memoryBackend({ failPut = false } = {}) {
++  const meta = new Map();
++  const data = new Map();
++
++  return {
++    meta,
++    data,
++    open: async () => {},
++    loadMeta: async () => [...meta.entries()].map(([k, v]) => [k, { ...v }]),
++    getData: async (k) => (data.has(k) ? data.get(k) : undefined),
++    put: async (k, m, d) => {
++      if (failPut) throw new Error("QuotaExceededError");
++      meta.set(k, { ...m });
++      data.set(k, d);
++    },
++    putMeta: async (entries) => entries.forEach(([k, m]) => meta.set(k, { ...m })),
++    delete: async (keys) => keys.forEach((k) => (meta.delete(k), data.delete(k))),
++    clear: async () => (meta.clear(), data.clear()),
++  };
++}
++
++const cache = (backend, capBytes = 1000) => {
++  const c = new PersistentCache(backend, { capBytes });
++  c.configure({ vaultId: "Vault" });
++  return c;
++};
++
++describe("isPersistable", () => {
++  it("keeps .obsidian files only", () => {
++    expect(isPersistable(".obsidian/plugins/example-plugin/plugin.wasm")).toBe(true);
++    expect(isPersistable("/.obsidian/app.json")).toBe(true);
++    expect(isPersistable("Library/note.md")).toBe(false);
++    expect(isPersistable(".obsidianx/a.js")).toBe(false);
++  });
++});
++
++describe("PersistentCache", () => {
++  const path = ".obsidian/plugins/a/main.js";
++  const meta = { mtime: 1, size: 3 };
++
++  it("returns a kept file while its mtime and size match", async () => {
++    const b = memoryBackend();
++    const c = cache(b);
++    await c.put(path, meta, "abc");
++
++    const again = cache(b); // a later visit
++    expect(await again.get(path, meta)).toBe("abc");
++    expect(again.stats.hits).toBe(1);
++  });
++
++  it("drops a kept file whose mtime or size changed", async () => {
++    const b = memoryBackend();
++    await cache(b).put(path, meta, "abc");
++
++    const c = cache(b);
++    expect(await c.get(path, { mtime: 2, size: 3 })).toBeNull();
++    expect(b.data.size).toBe(0);
++  });
++
++  it("keeps binary data", async () => {
++    const b = memoryBackend();
++    const bytes = new Uint8Array([1, 2, 3]);
++    await cache(b).put(".obsidian/plugins/s/s.wasm", meta, bytes);
++    expect(await cache(b).get(".obsidian/plugins/s/s.wasm", meta)).toEqual(bytes);
++  });
++
++  it("never keeps notes", async () => {
++    const b = memoryBackend();
++    await cache(b).put("Library/a.md", meta, "abc");
++    expect(b.data.size).toBe(0);
++  });
++
++  it("stays under the cap by dropping the least recently used", async () => {
++    vi.useFakeTimers();
++    const b = memoryBackend();
++    const c = cache(b, 1000);
++    vi.setSystemTime(1000);
++    await c.put(".obsidian/a.json", { mtime: 1, size: 200 }, "a".repeat(200));
++    vi.setSystemTime(2000);
++    await c.put(".obsidian/b.json", { mtime: 1, size: 200 }, "b".repeat(200));
++    vi.setSystemTime(3000);
++    await c.get(".obsidian/a.json", { mtime: 1, size: 200 }); // a used after b
++    vi.setSystemTime(4000);
++    await c.put(".obsidian/c.json", { mtime: 1, size: 200 }, "c".repeat(200));
++    await c.put(".obsidian/d.json", { mtime: 1, size: 200 }, "d".repeat(200));
++    vi.setSystemTime(5000);
++    await c.put(".obsidian/e.json", { mtime: 1, size: 250 }, "e".repeat(250));
++    expect(c.totalBytes).toBeLessThanOrEqual(1000);
++    expect(b.data.has("Vault\n.obsidian/b.json")).toBe(false); // least recently used went first
++    expect(b.data.has("Vault\n.obsidian/a.json")).toBe(true);
++    expect(c.stats.evicted).toBe(1);
++    vi.useRealTimers();
++  });
++
++  it("does not keep a file over a quarter of the cap", async () => {
++    const b = memoryBackend();
++    const c = cache(b, 1000);
++    await c.put(path, { mtime: 1, size: 300 }, "x".repeat(300));
++    expect(b.data.size).toBe(0);
++    expect(c.stats.skipped).toBe(1);
++  });
++
++  it("applies a lowered cap at the next start", async () => {
++    const b = memoryBackend();
++    const c = cache(b, 1000);
++    for (const n of ["a", "b", "c"]) await c.put(`.obsidian/${n}.json`, { mtime: 1, size: 200 }, n.repeat(200));
++    const smaller = cache(b, 450);
++    await smaller.ready();
++    expect(smaller.totalBytes).toBeLessThanOrEqual(450);
++    expect(b.data.size).toBe(2);
++  });
++
++  it("with the cap at 0, keeps nothing and empties the store", async () => {
++    const b = memoryBackend();
++    await cache(b).put(path, meta, "abc");
++    const off = cache(b, 0);
++    await off.ready();
++    expect(await off.get(path, meta)).toBeNull();
++    expect(b.data.size).toBe(0);
++  });
++
++  it("stops using the store after it fails (quota), without throwing", async () => {
++    const c = cache(memoryBackend({ failPut: true }));
++    await c.put(path, meta, "abc");
++    expect(c.stats.error).toMatch(/Quota/);
++    expect(c.enabled).toBe(false);
++    expect(await c.get(path, meta)).toBeNull();
++  });
++
++  it("keeps vaults apart", async () => {
++    const b = memoryBackend();
++    await cache(b).put(path, meta, "abc");
++    const other = new PersistentCache(b, { capBytes: 1000 });
++    other.configure({ vaultId: "Other" });
++    expect(await other.get(path, meta)).toBeNull();
++  });
++});
+diff --git a/packages/shim/src/fs/promises.js b/packages/shim/src/fs/promises.js
+index 8b61141..e2dd434 100644
+--- a/packages/shim/src/fs/promises.js
++++ b/packages/shim/src/fs/promises.js
+@@ -22,6 +22,7 @@ import { initWriteDurability, onFailure } from "./write-durability.js";
+ import { createUtimes } from "./utimes.js";
+ import { createReadAhead } from "./read-ahead.js";
+ import { isTextPath } from "./indexer-prefetch.js";
++import { persistentCache } from "./persistent-cache.js";
+ 
+ export function createFsPromises(metadataCache, contentCache, transport) {
+   initWriteCoalescer(transport);
+@@ -98,6 +99,7 @@ export function createFsPromises(metadataCache, contentCache, transport) {
+       }
+ 
+       let result = null;
++      let fileMeta = null; // the file's listing entry (mtime, size): local patch 0004 keeps .obsidian files by it
+ 
+       // Check input cache for files picked via browser file dialogs.
+       if (isInputCachePath(path)) {
+@@ -106,6 +108,7 @@ export function createFsPromises(metadataCache, contentCache, transport) {
+ 
+       if (result === null) {
+         const meta = metadataCache.get(resolved);
++        fileMeta = meta && meta.type === "file" ? meta : null;
+ 
+         if (meta && meta.type === "directory") {
+           const e = new Error("EISDIR: illegal operation on a directory, read");
+@@ -141,14 +144,25 @@ export function createFsPromises(metadataCache, contentCache, transport) {
+         }
+ 
+         const pathUpdatesBefore = contentCache.pathUpdates(resolved);
++        // Local patch 0004: a copy kept from an earlier visit, while its mtime and size still match the listing
++        const keep = fileMeta && !redirected;
++        const kept = keep ? await persistentCache.get(resolved, fileMeta) : null;
++
++        if (kept !== null) {
++          result = kept;
++        } else {
++          try {
++            result = await transport.readFile(resolved, encoding);
++          } catch (e) {
++            if (redirected && e.code === "ENOENT") {
++              result = await transport.readFile(path, encoding);
++            } else {
++              throw e;
++            }
++          }
+ 
+-        try {
+-          result = await transport.readFile(resolved, encoding);
+-        } catch (e) {
+-          if (redirected && e.code === "ENOENT") {
+-            result = await transport.readFile(path, encoding);
+-          } else {
+-            throw e;
++          if (keep) {
++            persistentCache.put(resolved, fileMeta, result).catch(() => {});
+           }
+         }
+ 
+diff --git a/packages/shim/src/fs/indexer-prefetch.js b/packages/shim/src/fs/indexer-prefetch.js
+index eaf5756..aafb529 100644
+--- a/packages/shim/src/fs/indexer-prefetch.js
++++ b/packages/shim/src/fs/indexer-prefetch.js
+@@ -1,5 +1,9 @@
+ // Pre-fetches vault file contents into the content cache before Obsidian boots, so its startup reads hit the cache instead of the network.
+ // The priority slice is awaited and gates boot; the bulk slice streams afterward without blocking it.
++// Local patch 0004: .obsidian files kept in the browser from an earlier visit (persistent-cache.js) are taken from
++// there while unchanged, and those fetched are kept.
++
++import { persistentCache } from "./persistent-cache.js";
+ 
+ const TEXT_EXTENSIONS = new Set([
+   ".md",
+@@ -116,7 +120,7 @@ function collectSlice(entries, predicate, perFileCap, budget, label) {
+       continue;
+     }
+ 
+-    files.push({ path, size });
++    files.push({ path, size, mtime: entry.mtime });
+     bytes += size;
+   }
+ 
+@@ -203,16 +207,34 @@ async function runBatches(vaultId, slice, contentCache, label, onProgress) {
+   const t0 = Date.now();
+   let cached = 0;
+   let received = 0;
++  let kept = 0;
+ 
+   // Report the total up front so the splash shows the target before the first batch lands.
+   if (onProgress) {
+     onProgress(0, slice.bytes);
+   }
+ 
++  // Local patch 0004: unchanged files kept from an earlier visit need no request
++  const byPath = new Map(slice.files.map((f) => [f.path, f]));
++  const fromKept = await Promise.all(slice.files.map(async (f) => {
++    const before = contentCache.pathUpdates(f.path);
++    const data = await persistentCache.get(f.path, f).catch(() => null);
++
++    return data !== null && contentCache.setFromServer(f.path, data, before);
++  }));
++  const toFetch = slice.files.filter((f, i) => !fromKept[i]);
++  kept = slice.files.length - toFetch.length;
++  cached += kept;
++
++  if (onProgress && kept) {
++    received += slice.files.reduce((n, f, i) => n + (fromKept[i] ? f.size : 0), 0);
++    onProgress(received, slice.bytes);
++  }
++
+   const batches = [];
+ 
+-  for (let i = 0; i < slice.files.length; i += BATCH_SIZE) {
+-    batches.push(slice.files.slice(i, i + BATCH_SIZE));
++  for (let i = 0; i < toFetch.length; i += BATCH_SIZE) {
++    batches.push(toFetch.slice(i, i + BATCH_SIZE));
+   }
+ 
+   let cursor = 0;
+@@ -243,6 +265,7 @@ async function runBatches(vaultId, slice, contentCache, label, onProgress) {
+           contentCache.setFromServer(path, content, pathUpdatesBefore.get(path))
+         ) {
+           cached++;
++          persistentCache.put(path, byPath.get(path), content).catch(() => {});
+         }
+       }
+ 
+@@ -262,7 +285,8 @@ async function runBatches(vaultId, slice, contentCache, label, onProgress) {
+   const ms = Date.now() - t0;
+ 
+   console.log(
+-    `[ignis] Prefetched ${label} ${cached}/${slice.files.length} files (${(slice.bytes / 1024).toFixed(0)} KB) in ${ms}ms`,
++    `[ignis] Prefetched ${label} ${cached}/${slice.files.length} files (${(slice.bytes / 1024).toFixed(0)} KB) in ${ms}ms`
++      + (kept ? `, ${kept} of them kept from an earlier visit` : ""),
+   );
+ }
+ 
+diff --git a/apps/ignis-server/server/settings.js b/apps/ignis-server/server/settings.js
+index a805498..1cb989d 100644
+--- a/apps/ignis-server/server/settings.js
++++ b/apps/ignis-server/server/settings.js
+@@ -8,6 +8,9 @@ const SETTINGS_FILE = path.join(config.dataRoot, "server-settings.json");
+ 
+ const DEFAULTS = {
+   contentCacheBytes: 50 * 1024 * 1024,
++  // Local patch 0004: .obsidian files (settings, plugins) each browser keeps between visits, at most this many bytes
++  // (0: none kept); packages/shim/src/fs/persistent-cache.js.
++  persistentCacheBytes: 100 * 1024 * 1024,
+   inputCacheBytes: 200 * 1024 * 1024,
+   inputCacheTtlMs: 5 * 60 * 1000,
+   writeCoalesceMs: 0,
+diff --git a/apps/ignis-server/server/routes/settings.js b/apps/ignis-server/server/routes/settings.js
+index 2c3e748..ad6d3dc 100644
+--- a/apps/ignis-server/server/routes/settings.js
++++ b/apps/ignis-server/server/routes/settings.js
+@@ -8,6 +8,7 @@ const router = express.Router();
+ 
+ const NUMBER_KEYS = [
+   "contentCacheBytes",
++  "persistentCacheBytes",
+   "inputCacheBytes",
+   "inputCacheTtlMs",
+   "writeCoalesceMs",
+@@ -15,6 +16,8 @@ const NUMBER_KEYS = [
+ ];
+ const LIST_KEYS = ["proxyAllowlist", "directFetchHosts", "trustedVaults"];
+ 
++// Local patch 0004: a browser's kept files stay well within a phone's storage
++const MAX_PERSISTENT_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
+ const MAX_RULE_SETS = 64;
+ const MAX_PATTERNS_PER_SET = 200;
+ const MAX_PATTERN_LENGTH = 256;
+@@ -61,6 +64,10 @@ function validate(body) {
+       throw new Error(`${key} must be a non-negative integer`);
+     }
+ 
++    if (key === "persistentCacheBytes" && n > MAX_PERSISTENT_CACHE_BYTES) {
++      throw new Error(`persistentCacheBytes must be between 0 and ${MAX_PERSISTENT_CACHE_BYTES}`);
++    }
++
+     if (key === "maxBodyBytes" && (n < 1 || n > settings.MAX_BODY_BACKSTOP)) {
+       throw new Error(
+         `maxBodyBytes must be between 1 and ${settings.MAX_BODY_BACKSTOP}`,
+diff --git a/apps/ignis-server/server/cache/crawl.js b/apps/ignis-server/server/cache/crawl.js
+index 0955adb..cf3dc16 100644
+--- a/apps/ignis-server/server/cache/crawl.js
++++ b/apps/ignis-server/server/cache/crawl.js
+@@ -134,6 +134,7 @@ function buildResponse(vaultId, vaultPath, tree, etag) {
+     virtualPlugins: getVirtualPluginsForVault(vaultId, getVersion()),
+     settings: {
+       contentCacheBytes: settings.get("contentCacheBytes"),
++      persistentCacheBytes: settings.get("persistentCacheBytes"),
+       inputCacheBytes: settings.get("inputCacheBytes"),
+       inputCacheTtlMs: settings.get("inputCacheTtlMs"),
+       directFetchHosts: settings.get("directFetchHosts"),

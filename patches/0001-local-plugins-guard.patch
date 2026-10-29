@@ -1,0 +1,166 @@
+diff --git a/packages/shim/src/guards/local-plugins-guard.js b/packages/shim/src/guards/local-plugins-guard.js
+new file mode 100644
+index 0000000..d433249
+--- /dev/null
++++ b/packages/shim/src/guards/local-plugins-guard.js
+@@ -0,0 +1,140 @@
++// Local patch (Ignis Control, 2026-10-23; patches/ in the ignis-control repository): Ignis shares .obsidian with desktop
++// Obsidian on the same machine, so two things are kept apart in the browser.
++// 1. Community plugins listed in .obsidian/ignis-disabled-plugins.json (a JSON array of ids) stay off in Ignis while
++//    desktop keeps running them: reads of community-plugins.json leave them out, and writes put back the ones the file
++//    on disk has, so a plugin toggled in Ignis never switches them off on desktop.
++// 2. The layout: with no ?workspace= in the URL, workspace.json is read and written as workspace-ignis.json, so the
++//    browser and desktop Obsidian do not overwrite each other's open tabs and panes.
++// 3. Plugins switched on or off on desktop follow in an open tab: when community-plugins.json changes on disk, the
++//    running set is brought in line with it (new plugins' manifests are read first). Obsidian reads the file only at
++//    start-up, so without this a tab would keep its old set until reloaded.
++
++import {
++  registerPathResolver,
++  registerReadTransform,
++  registerWriteTransform,
++} from "../fs/transforms.js";
++import { fsShim } from "../fs/index.js";
++
++const LIST_PATH = ".obsidian/community-plugins.json";
++const DISABLED_PATH = ".obsidian/ignis-disabled-plugins.json";
++const WORKSPACE_PATH = ".obsidian/workspace.json";
++const IGNIS_WORKSPACE_PATH = ".obsidian/workspace-ignis.json";
++
++function parseIds(data) {
++  try {
++    const text = typeof data === "string" ? data : new TextDecoder().decode(data);
++    const ids = JSON.parse(text);
++
++    return Array.isArray(ids) ? ids : null;
++  } catch {
++    return null;
++  }
++}
++
++function readIds(path) {
++  try {
++    return parseIds(fsShim.readFileSync(path, "utf-8"));
++  } catch {
++    return null;
++  }
++}
++
++// Bring the running plugins in line with community-plugins.json as this tab reads it (without the kept-off ones).
++async function applyEnabledList() {
++  const plugins = window.app?.plugins;
++
++  if (!plugins || (typeof plugins.isEnabled === "function" && !plugins.isEnabled())) {
++    return; // Obsidian not booted yet, or community plugins in restricted mode
++  }
++
++  const wanted = readIds(LIST_PATH);
++
++  if (!wanted) {
++    return;
++  }
++
++  if (wanted.some((id) => !plugins.manifests[id])) {
++    await plugins.loadManifests(); // a plugin installed on desktop since this tab loaded
++  }
++
++  const want = new Set(wanted);
++
++  for (const id of wanted) {
++    if (!plugins.enabledPlugins.has(id) && plugins.manifests[id]) {
++      console.log(`[ignis] Local plugins guard: switching on ${id} (switched on elsewhere)`);
++      await plugins.enablePlugin(id);
++    }
++  }
++
++  for (const id of [...plugins.enabledPlugins]) {
++    if (!want.has(id)) {
++      console.log(`[ignis] Local plugins guard: switching off ${id} (switched off elsewhere)`);
++      await plugins.disablePlugin(id);
++    }
++  }
++}
++
++function followEnabledList() {
++  let timer = null;
++
++  // Changes made by this tab are not echoed back (Ignis's echo guard), so this sees only other writers.
++  fsShim.watch(".obsidian", (eventType, filename) => {
++    if (filename !== "community-plugins.json") {
++      return;
++    }
++
++    clearTimeout(timer);
++    timer = setTimeout(() => {
++      applyEnabledList().catch((e) => console.error("[ignis] Local plugins guard:", e));
++    }, 500);
++  });
++}
++
++export function initLocalPluginsGuard() {
++  registerPathResolver(
++    (path) => path === WORKSPACE_PATH && !window.__workspaceName,
++    () => IGNIS_WORKSPACE_PATH,
++  );
++
++  followEnabledList();
++
++  const disabled = readIds(DISABLED_PATH);
++
++  if (!disabled || disabled.length === 0) {
++    return;
++  }
++
++  const off = new Set(disabled);
++  // Set while the write transform reads the file as stored, so the read transform passes it through unfiltered.
++  let raw = false;
++
++  registerReadTransform(LIST_PATH, (data) => {
++    const ids = raw ? null : parseIds(data);
++
++    return ids ? JSON.stringify(ids.filter((id) => !off.has(id)), null, 2) : data;
++  });
++
++  registerWriteTransform(LIST_PATH, (data) => {
++    const ids = parseIds(data);
++
++    if (!ids) {
++      return data;
++    }
++
++    raw = true;
++    let stored;
++
++    try {
++      stored = readIds(LIST_PATH) || [];
++    } finally {
++      raw = false;
++    }
++
++    const kept = stored.filter((id) => off.has(id) && !ids.includes(id));
++
++    return JSON.stringify([...ids, ...kept], null, 2);
++  });
++
++  console.log(`[ignis] Local plugins guard: kept off in the browser: ${disabled.join(", ")}`);
++}
+diff --git a/packages/shim/src/init.js b/packages/shim/src/init.js
+index bde9230..64c3cbd 100644
+--- a/packages/shim/src/init.js
++++ b/packages/shim/src/init.js
+@@ -16,6 +16,7 @@ import { initNativeMenuGuard } from "./guards/native-menu-guard.js";
+ import { initSettingsWindowGuard } from "./guards/settings-window-guard.js";
+ import { initSpellcheckGuard } from "./guards/spellcheck-guard.js";
+ import { initPopoutGuard } from "./guards/popout-guard.js";
++import { initLocalPluginsGuard } from "./guards/local-plugins-guard.js";
+ 
+ let bootstrapVirtualPlugins = [];
+ 
+@@ -264,6 +265,7 @@ function resolveWorkspaceAndAppearance() {
+   initNativeMenuGuard();
+   initSettingsWindowGuard();
+   initSpellcheckGuard();
++  initLocalPluginsGuard();
+ }
+ 
+ export function initialize() {

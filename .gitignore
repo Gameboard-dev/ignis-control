@@ -1,0 +1,23 @@
+launcher/target/
+
+# Never committed: secrets and keys, Obsidian's plugin settings (data.json can hold keys and paths),
+# the launcher's runtime files, logs, editor and assistant folders, local builds.
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+data.json
+status.json
+*.log
+data/
+runtime/
+.vscode/
+.claude/
+target/
+__pycache__/
+*.pyc
+node_modules/
+.DS_Store
+Thumbs.db

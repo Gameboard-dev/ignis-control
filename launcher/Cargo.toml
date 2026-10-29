@@ -1,0 +1,28 @@
+[package]
+name = "ignis-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Ignis's launcher, in Rust (first part: the vault access repair, event-driven). See README.md."
+license = "MIT"
+publish = false
+
+# A native Windows program, not a plugin: its own workspace (the folder's workspace builds WebAssembly).
+[workspace]
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

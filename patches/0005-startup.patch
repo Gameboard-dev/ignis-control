@@ -1,0 +1,66 @@
+diff --git a/packages/shim/build.js b/packages/shim/build.js
+index d92043a..f64fa40 100644
+--- a/packages/shim/build.js
++++ b/packages/shim/build.js
+@@ -6,7 +6,9 @@ const { version: semver } = require("../../package.json");
+ // Root build.js sets IGNIS_BUILD_RESOLVED when it runs first; standalone invocation falls back to a dev stamp.
+ const build = process.env.IGNIS_BUILD_RESOLVED || "dev";
+ 
+-module.exports = esbuild.build({
++// Local patch 0005 (Ignis Control): the served bundle is minified; a readable copy is written beside it for reference
++// (reference/shim-loader.js; dist/ is what the server serves).
++const options = {
+   entryPoints: [path.join(__dirname, "src", "loader.js")],
+   bundle: true,
+   outfile: path.join(__dirname, "dist", "shim-loader.js"),
+@@ -25,4 +27,10 @@ module.exports = esbuild.build({
+     __IGNIS_BUILD__: JSON.stringify(build),
+   },
+   logLevel: "info",
+-});
++};
++
++module.exports = Promise.all([
++  // minified, so a phone downloads and parses less at every start
++  esbuild.build({ ...options, minify: true }),
++  esbuild.build({ ...options, outfile: path.join(__dirname, "reference", "shim-loader.js") }),
++]);
+diff --git a/packages/ui/build.js b/packages/ui/build.js
+index 67b14b5..aab18f3 100644
+--- a/packages/ui/build.js
++++ b/packages/ui/build.js
+@@ -2,7 +2,9 @@ const esbuild = require("esbuild");
+ const sveltePlugin = require("esbuild-svelte");
+ const path = require("path");
+ 
+-module.exports = esbuild.build({
++// Local patch 0005 (Ignis Control): the served bundle is minified; a readable copy is written beside it for reference
++// (reference/ignis-ui.js; dist/ is what the server serves).
++const options = {
+   entryPoints: [path.join(__dirname, "src", "index.js")],
+   bundle: true,
+   outfile: path.join(__dirname, "dist", "ignis-ui.js"),
+@@ -14,4 +16,10 @@ module.exports = esbuild.build({
+   conditions: ["svelte", "browser"],
+   plugins: [sveltePlugin({ compilerOptions: { css: "injected" } })],
+   logLevel: "info",
+-});
++};
++
++module.exports = Promise.all([
++  // minified, so a phone downloads and parses less at every start
++  esbuild.build({ ...options, minify: true }),
++  esbuild.build({ ...options, outfile: path.join(__dirname, "reference", "ignis-ui.js") }),
++]);
+diff --git a/packages/shim/src/loader.js b/packages/shim/src/loader.js
+--- a/packages/shim/src/loader.js
++++ b/packages/shim/src/loader.js
+@@ -33,6 +33,8 @@
+ // __IGNIS_VERSION__ (semver) and __IGNIS_BUILD__ are replaced at build time.
+ window.__ignis = { version: __IGNIS_VERSION__, build: __IGNIS_BUILD__ };
+ window.__ignis_registerUI = registerUI;
++// local patch 0005: the page says it is Ignis, so a CSS snippet can style it apart from desktop (html.is-ignis)
++document.documentElement.classList.add("is-ignis");
+ 
+ installDiagnostics(); // local patch 0003: errors, plugin load times, stalls, memory and crashes to the server's log
+ requestPersistentStorage(); // local patch 0004: keep the note index from being cleared on phones
