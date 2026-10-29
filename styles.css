@@ -51,15 +51,52 @@
 }
 .ignis-control .ignis-fact-key { color: var(--text-muted); }
 
-.ignis-control .ignis-log-box summary {
-  cursor: pointer;
-  font-size: var(--font-ui-small);
-  color: var(--text-muted);
+/* The log pane: a bar (source, filter, options, copy), the lines, and where they come from */
+.ignis-control .ignis-logpane { margin: var(--size-4-2) 0 var(--size-4-4); }
+.ignis-control .ignis-logbar {
   display: flex;
   align-items: center;
-  gap: var(--size-4-3);
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+  margin-bottom: var(--size-4-2);
+}
+.ignis-control .ignis-logfilter { flex: 1 1 10em; min-width: 8em; }
+.ignis-control .ignis-logopt {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--size-4-1);
+}
+.ignis-control .ignis-logview {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+  height: 22em;
+  min-height: 6em;
+  overflow: auto;
+  resize: vertical;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: var(--size-4-1) var(--size-4-2);
+  user-select: text;
+}
+/* "Wrap lines" on: long paths with no spaces wrap too. Off: lines stay whole and the pane scrolls sideways. */
+.ignis-control .ignis-logview.is-wrap .ignis-logline { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ignis-control .ignis-logview.is-nowrap { overflow-x: auto; }
+.ignis-control .ignis-logview.is-nowrap .ignis-logline { white-space: pre; width: max-content; min-width: 100%; }
+.ignis-control .ignis-logline.is-warn { color: var(--color-orange); }
+.ignis-control .ignis-logline.is-error { color: var(--text-error); }
+.ignis-control .ignis-logempty { color: var(--text-faint); font-style: italic; }
+.ignis-control .ignis-logsource {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  margin-top: var(--size-4-1);
+  overflow-wrap: anywhere;
 }
 
+/* The output of the sandbox check (a modal) */
 .ignis-log {
   font-size: var(--font-ui-smaller);
   height: 18em;          /* fixed, so updates never move the page */
@@ -109,7 +146,7 @@
 .ignis-exclusions { margin-bottom: var(--size-4-4); max-height: 260px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); padding: var(--size-2-2) var(--size-4-3); background: var(--background-secondary); }
 .ignis-exclusions .setting-item:first-child { border-top: none; }
 
-/* The settings tab's contents (scoped to this plugin's tab): a column of links to the left of the settings that
+/* The contents of the settings tab (scoped to this plugin): a column of links to the left of the settings that
    stays in view as they scroll, where the window is wide enough; above the settings, in a line, where it is not. */
 .ignis-control .setting-contents { margin-bottom: var(--size-4-4); font-size: var(--font-ui-small); }
 .ignis-control .setting-contents-title { font-weight: var(--font-semibold); margin-bottom: var(--size-2-2); }
@@ -117,7 +154,7 @@
   body:not(.is-mobile) .ignis-control.setting-contents-layout {
     display: grid;
     grid-template-columns: 11rem minmax(0, 1fr);
-    gap: 0 var(--size-4-6); /* not column-gap: the directory's CSS lint reads it as multi-column layout */
+    gap: 0 var(--size-4-6); /* the gap shorthand: a CSS lint reads the column-only property as multi-column layout */
     align-items: start;
     grid-auto-rows: max-content; /* a scrolling box keeps its height (the tab has a fixed height) */
   }

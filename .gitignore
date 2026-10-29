@@ -21,3 +21,6 @@ __pycache__/
 node_modules/
 .DS_Store
 Thumbs.db
+
+# Words the release check must not find (your own names, paths, addresses): never committed.
+.release-scan.local

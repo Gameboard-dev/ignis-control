@@ -212,8 +212,8 @@ Inside Ignis the dot is always green: the page came through the tunnel.
 | `latex build for <address>: ok in <n> s` or `failed in <n> s` | LaTeX build result |
 | `access: …` | Vault access repair |
 
-At each start, a log longer than 10,000 lines is cut to its last 5,000. The plugin's **Live log** shows the last 40
-lines and hides any line that holds a JSON Web Token.
+At each start, a log longer than 10,000 lines is cut to its last 5,000. The plugin's **Log** pane follows it
+([below](#the-log-pane)).
 
 ## The plugin
 
@@ -224,6 +224,32 @@ start a program on the PC.
 
 | Mode | Sections |
 | --- | --- |
-| Desktop Obsidian on Windows | Status, Controls, Server, Plugin exclusions, Browser tabs, This panel, Resources, Guide |
+| Desktop Obsidian on Windows | Status, Log, Controls, Server, Plugin exclusions, Browser tabs, This panel, Resources, Guide |
 | Inside Ignis | This tab, Server, Plugin exclusions, Browser tabs, Guide |
 | Desktop Obsidian on another system | A note that the plugin controls Windows features only |
+
+### The log pane
+
+**Settings → Ignis Control → Log**, in desktop Obsidian on Windows.
+
+| Part | What it does |
+| --- | --- |
+| Source | Everything in `ignis.log`, or only the lines of one part: the launcher, Ignis server (`[ignis]`), the browser tabs' reports (`[ignis] client …`), cloudflared (`[cloudflared]`), the relay (`relay:` and `[augmented-view]`), vault access repair (`access:`), LaTeX builds (`latex build …`, `relay: latex …`); or the last LaTeX build's transcript, `<vault>\LaTeX\compiled\.ignis-build.log` |
+| Filter | Shows only the lines containing the text typed (any case) |
+| Follow new lines | Keeps the newest line in view |
+| Wrap lines | On: long lines wrap. Off: each line stays whole and the pane scrolls sideways |
+| Copy | Writes the lines shown to the clipboard (on selection only) |
+| Height | Drag the pane's lower edge |
+
+- `ignis.log` is found in the Ignis folder (from `location.json` or **This panel → Ignis folder**); nothing is
+  hard-coded.
+- The pane reads only while the settings tab is open: the last 256 KB at first, then what is added, once a second,
+  with Node's `fs`. A file that shrank or was replaced (log trimming at the launcher's start, a new build transcript)
+  is read again from its start; a burst of more than 1 MB is skipped to its last 1 MB, and the pane says so.
+- At most 2,000 lines are kept per source, and shown.
+- Before a line is kept, the pane hides JSON Web Tokens (the tunnel token, Access tokens), cookie and authorization
+  header values, `token=`/`secret=`/`password=`/`aud=`-style values, Cloudflare team names
+  (`<team>.cloudflareaccess.com`), hex strings of 32 or more digits (AUD tags), other long key-like strings, e-mail
+  addresses and the site's hostname. Lines are coloured by level (cloudflared's own `WRN`/`ERR`, otherwise words such as
+  `failed` or `exited with code 1`).
+- Source, follow and wrap are kept per device in Obsidian's local storage.

@@ -1,7 +1,8 @@
 # Troubleshooting
 
 Start with the plugin's panel (**Settings → Ignis Control → Status**): the dot, each process's state and last exit,
-and the **Live log**. The full log is `<root>\ignis\ignis.log`. Cloudflare-side problems are also covered in
+and the **Log** pane (choose a source: the launcher, Ignis, the browser tabs, cloudflared, the relay, vault access,
+LaTeX). The full log is `<root>\ignis\ignis.log`. Cloudflare-side problems are also covered in
 [cloudflare.md](cloudflare.md#12-when-something-is-wrong).
 
 ## The launcher and the status

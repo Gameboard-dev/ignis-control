@@ -1,0 +1,81 @@
+# The plugin's release: checked here from the tagged commit, its three files attested (build provenance) and
+# published. Runs only on a pushed tag x.y.z (the manifest's version). Nothing runs on ordinary pushes.
+#
+# The plugin has no build step: main.js, manifest.json and styles.css are the committed files. The launcher
+# (ignis_native.py) is not released here; it is source in the tag's archive.
+#
+# Attestations: https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds
+# Check a file with: gh attestation verify main.js --repo Gameboard-dev/ignis-control
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # the release
+      id-token: write # the attestations' signing certificate
+      attestations: write
+    steps:
+      - name: The repository at the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: The plugin's tests (the launcher's need Windows and run on the author's PC)
+        run: |
+          set -eu
+          node --check main.js
+          node test/log_test.js
+          node test/stop_test.js
+
+      - name: Stylesheet against Obsidian's Chromium (doiuse)
+        run: |
+          set -eu
+          out="$(npx --yes doiuse@6.0.6 -b "chrome >= 120" styles.css 2>&1 || true)"
+          echo "$out"
+          if printf '%s\n' "$out" | grep -q "styles.css:"; then echo "doiuse found unsupported CSS"; exit 1; fi
+
+      - name: Only the three files, the versions agree, nothing personal inside
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/release"
+          cp main.js manifest.json styles.css "$RUNNER_TEMP/release/"
+          node scripts/release-check.mjs --tag "$GITHUB_REF_NAME" --dir "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          test "$(ls | sort | tr '\n' ' ')" = "main.js manifest.json styles.css " || { ls -la; exit 1; }
+          sha256sum main.js manifest.json styles.css
+
+      - name: Attest the files' provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/main.js
+            ${{ runner.temp }}/release/manifest.json
+            ${{ runner.temp }}/release/styles.css
+
+      - name: Publish the release with exactly those files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          files="$RUNNER_TEMP/release/main.js $RUNNER_TEMP/release/manifest.json $RUNNER_TEMP/release/styles.css"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber $files
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "Ignis Control $GITHUB_REF_NAME" \
+              --notes-file ".github/release-notes/$GITHUB_REF_NAME.md" $files
+          fi

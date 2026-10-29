@@ -94,7 +94,7 @@ e-mail address and is always refused. A request made on the PC itself has no tok
 | --- | --- | --- |
 | `<root>\ignis\.env` | Hostname, team domain, AUD tag, allowed addresses, the vault's folder, Augmented View's port | Git-ignored; outside the vault; not readable or writable by the sandbox (`check` probes it) |
 | `<root>\ignis\status.json` | Process ids, counts, the public URL | Git-ignored; outside the vault |
-| `<root>\ignis\ignis.log` | Requests that failed, tab reports, relay decisions | Git-ignored; outside the vault. The plugin hides token-like lines in its live log |
+| `<root>\ignis\ignis.log` | Requests that failed, tab reports, relay decisions | Git-ignored; outside the vault. The plugin's **Log** pane hides tokens, Cloudflare team names, AUD tags, e-mail addresses and the site's hostname |
 | `<root>\ignis\runtime\extra-ca.pem` | A public root certificate | Git-ignored (`*.pem`) |
 
 ## The sandbox probes

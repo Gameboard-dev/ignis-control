@@ -10,6 +10,14 @@ the repository. Check the script's syntax with `node --check main.js`.
 A release attaches exactly these three files to a GitHub release whose tag is the version in `manifest.json` (no
 leading `v`), and adds the version and its minimum Obsidian version to `versions.json`.
 
+Releases are published by the workflow `.github/workflows/release.yml` when a tag `x.y.z` is pushed: it runs the
+plugin's tests, checks `styles.css` with doiuse against Obsidian's Chromium, runs `scripts/release-check.mjs` (versions
+agree, exactly three files, no user paths, e-mail addresses, `eval`, shell, browser storage or rejected CSS), attests
+the three files' provenance and publishes them with `.github/release-notes/<tag>.md`. Check a downloaded file with
+`gh attestation verify main.js --repo Gameboard-dev/ignis-control`. Before tagging, run
+`node scripts/release-check.mjs` locally; words that must never appear can be listed in the git-ignored
+`.release-scan.local`.
+
 ## The launcher
 
 `ignis_native.py` is a Python script; it needs no build. It uses `pywin32` and `psutil`, and `pygments` for the LaTeX
@@ -24,6 +32,7 @@ python -m pip install pywin32 psutil pygments
 ```powershell
 python -I test/relay_test.py
 node test/stop_test.js
+node test/log_test.js
 ```
 
 The tests run the launcher's rules without named pipes or the sandbox: the relay's allowlists and refusals, that a port

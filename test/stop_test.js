@@ -11,7 +11,7 @@ Module._load = function (request, ...rest) {
   if (request === "obsidian") {
     const Base = class {};
     return { Plugin: Base, PluginSettingTab: Base, Setting: Base, Modal: Base, Notice: Base,
-      Platform: { isDesktopApp: true }, requestUrl: () => null };
+      Platform: { isDesktopApp: true }, requestUrl: () => null, setIcon: () => undefined };
   }
   return load.call(this, request, ...rest);
 };

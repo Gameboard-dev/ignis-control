@@ -54,7 +54,8 @@ disclose, so you know what you install. In short (the full account is [docs/disc
   connects in.
 - **Login first.** Cloudflare Access (a one-time PIN sent by e-mail) stands in front of the public address.
 - **The tunnel token stays in Credential Manager.** It is never written to a file, a command line or the log.
-- **Status and control.** A status bar dot (green, amber, red, hollow), a process table, the live log, start, stop,
+- **Status and control.** A status bar dot (green, amber, red, hollow), a process table, a log pane (by source,
+  filtered, followed, copied, with secrets hidden), start, stop,
   restart, the sandbox check and a check of the public address.
 - **From any device.** Inside Ignis, the same panel changes Ignis's server options, the plugins kept off in Ignis,
   and the tab diagnostics.

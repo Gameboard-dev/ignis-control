@@ -27,7 +27,7 @@
 //
 // What it runs, which network requests it makes and which files outside the vault it reads: docs/disclosures.md.
 
-const { Plugin, PluginSettingTab, Setting, Modal, Notice, Platform, requestUrl } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, Platform, requestUrl, setIcon } = require("obsidian");
 
 const IN_IGNIS = typeof window !== "undefined" && typeof window.__ignis === "object" && window.__ignis !== null;
 const DESKTOP = !IN_IGNIS && Platform.isDesktopApp;
@@ -257,21 +257,15 @@ module.exports = class IgnisControl extends Plugin {
     return { level: "ok", symbol: "●", text: `running, tunnel connected (${n} connection${n === 1 ? "" : "s"})` };
   }
 
-  async logTail(lines = 40) {
-    try {
-      const fh = await fs.promises.open(this.file("ignis.log"), "r");
-      const { size } = await fh.stat();
-      const len = Math.min(size, 48 * 1024);
-      const buf = Buffer.alloc(len);
-      await fh.read(buf, 0, len, size - len);
-      await fh.close();
-      return buf.toString("utf8").split(/\r?\n/)
-        .map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")) // Ignis colours its request log
-        .filter((l) => l.trim() && !/eyJ[A-Za-z0-9_-]{20,}/.test(l)) // never show anything token-like
-        .slice(-lines).join("\n");
-    } catch {
-      return "(no log yet)";
-    }
+  // The files the log pane can follow (desktop only; both outside or at the edge of the vault, read with Node's fs):
+  // the launcher's ignis.log in the Ignis folder (from location.json or this device's setting), and the transcript the
+  // launcher writes for the last LaTeX build through Ignis, in the vault's LaTeX/compiled folder.
+  logFiles() {
+    const base = this.app.vault.adapter?.getBasePath?.();
+    return {
+      main: this.device.ignisDir ? this.file("ignis.log") : "",
+      build: base ? path.join(base, "LaTeX", "compiled", ".ignis-build.log") : "",
+    };
   }
 
   // --- controls ---
@@ -404,10 +398,14 @@ class IgnisTab extends PluginSettingTab {
 
   hide() {
     this.plugin.onRefresh = null;
+    this.logPane?.unmount(); // the pane reads the logs only while this tab is open
+    this.logPane = null;
   }
 
   async display() {
     const el = this.containerEl;
+    this.logPane?.unmount();
+    this.logPane = null;
     el.empty();
     el.removeClass("setting-contents-layout");
     const nav = el.createEl("nav", { cls: "setting-contents" });
@@ -454,6 +452,7 @@ class IgnisTab extends PluginSettingTab {
     }
 
     this.statusSection(el);
+    this.logSection(el);
     this.controlsSection(el);
     await this.serverSettingsSection(el);
     await this.pluginsSection(el);
@@ -614,17 +613,11 @@ class IgnisTab extends PluginSettingTab {
 
     const facts = box.createDiv("ignis-facts");
 
-    const log = box.createEl("details", { cls: "ignis-log-box" }); // collapsed until opened
-    log.createEl("summary", { text: "Live log" });
-    const pre = log.createEl("pre", { cls: "ignis-log" });
-    log.addEventListener("toggle", () => log.open && draw());
-
     let drawing = false;
     const draw = async () => {
       if (drawing) return;
       drawing = true;
       try {
-        const logText = log.open ? await plugin.logTail() : null; // read before touching the page
         const s = plugin.status;
         const alive = plugin.launcherAlive(s);
 
@@ -670,18 +663,20 @@ class IgnisTab extends PluginSettingTab {
           }
           facts.replaceChildren(grid);
         }
-
-        if (logText !== null && pre.textContent !== logText) {
-          const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
-          pre.textContent = logText;
-          if (atEnd) pre.scrollTop = pre.scrollHeight; // follow new lines unless you scrolled up
-        }
       } finally {
         drawing = false;
       }
     };
     plugin.onRefresh = draw;
     draw();
+  }
+
+  // The launcher's logs, as they grow (read only while this tab is open)
+  logSection(el) {
+    new Setting(el).setHeading().setName("Log")
+      .setDesc("The launcher's log, with the output of Ignis, cloudflared and the relay, as it grows. Tokens, Cloudflare team names, AUD tags, e-mail addresses and other secret-looking values are hidden. Read only while this tab is open.");
+    this.logPane = new LogPane(this.plugin);
+    this.logPane.mount(el);
   }
 
   controlsSection(el) {
@@ -693,7 +688,7 @@ class IgnisTab extends PluginSettingTab {
       .addButton((b) => b.setButtonText("Restart").onClick(() => plugin.restart()))
       .addButton((b) => b.setButtonText("Stop").setWarning().onClick(() => plugin.stop()));
     new Setting(el).setName("Open")
-      .setDesc("The site in your browser, or Ignis's documentation on the web. The log is the Live log under Status.")
+      .setDesc("The site in your browser, or Ignis's documentation on the web. The launcher's logs are under Log.")
       .addButton((b) => b.setButtonText("Site").onClick(() => plugin.openSite()))
       .addButton((b) => b.setButtonText("Guide").onClick(() => window.open(GUIDE_URL)));
     new Setting(el).setName("Sandbox check")
@@ -876,5 +871,333 @@ function checkLauncherProcess(pid) {
   });
 }
 
-// for test/stop_test.js (plain Node, with Obsidian's module stubbed)
-module.exports.forTests = { isLauncherImage, imageFromTasklist, tasklistPath, checkLauncherProcess };
+// --- the log pane (settings tab, desktop): the launcher's logs as they grow ---
+
+const LOG_MAX_LINES = 2000; // kept per source, and shown at most
+const LOG_POLL_MS = 1000;
+
+// The pane's sources. ignis.log holds everything the launcher supervises: its own lines, and each sandboxed process's
+// output prefixed "  [name] " (Ignis's server, cloudflared, the Augmented View forwarder); "build" is a file of its own.
+const LOG_SOURCES = [
+  ["all", "Everything (ignis.log)"],
+  ["launcher", "The launcher"],
+  ["ignis", "Ignis server"],
+  ["tabs", "Browser tabs' reports"],
+  ["cloudflared", "cloudflared (the tunnel)"],
+  ["relay", "The relay"],
+  ["access", "Vault access repair"],
+  ["latex", "LaTeX builds"],
+  ["build", "Last LaTeX build's transcript"],
+];
+
+// Which source a line of ignis.log belongs to
+function lineSource(line) {
+  const body = String(line).replace(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d /, "");
+  if (/^\s*\[ignis\] client /.test(body)) return "tabs";
+  if (/^\s*\[ignis\] /.test(body)) return "ignis";
+  if (/^\s*\[cloudflared\] /.test(body)) return "cloudflared";
+  if (/^relay: latex|^latex build /.test(body)) return "latex";
+  if (/^\s*\[augmented-view\] |^relay: /.test(body)) return "relay";
+  if (/^access: /.test(body)) return "access";
+  return "launcher";
+}
+
+function lineLevel(line) {
+  // cloudflared names its own level (INF, WRN, ERR, FTL): that decides, whatever words the message holds
+  const own = /\s(DBG|INF|WRN|ERR|FTL)\s/.exec(line);
+  if (own) return own[1] === "ERR" || own[1] === "FTL" ? "error" : own[1] === "WRN" ? "warn" : "info";
+  if (/\b(error|failed|fail|refused|denied|EPERM|ENOENT|exited with code [1-9]|could not)\b/i.test(line)) return "error";
+  if (/\b(warn|warning|restarting|retrying|timed out|unavailable)\b/i.test(line)) return "warn";
+  return "info";
+}
+
+// Values hidden before a line is kept: what could let someone into the tunnel, the site or an account, or identify
+// the Access set-up, and long strings that look like keys
+const REDACTIONS = [
+  [/\x1b\[[0-9;]*m/g, ""], // colour codes
+  [/eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+){0,2}/g, "<token>"], // JSON Web Tokens: Access, the tunnel token
+  [/\b((?:cf-access-jwt-assertion|cf_authorization|authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*).*$/gi, "$1<hidden>"],
+  [/\b((?:tunnel[_-]?token|token|secret|password|passwd|api[_-]?key|client[_-]?(?:id|secret)|aud|audience)\s*[=:]\s*)["']?[^\s"',;&]+/gi, "$1<hidden>"],
+  [/\b[a-z0-9-]+\.cloudflareaccess\.com\b/gi, "<team>.cloudflareaccess.com"], // the Zero Trust team
+  [/\b[0-9a-f]{32,}\b/gi, "<hex>"], // AUD tags (64 hex digits), keys
+  [/[A-Za-z0-9+_-]{40,}={0,2}/g, "<long value>"], // base64-like keys
+  [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "<e-mail>"],
+];
+
+// `site`: the public hostname (from the status file), hidden too, so a copied log does not name the site
+function redactLine(line, site = "") {
+  let out = String(line);
+  for (const [rx, to] of REDACTIONS) out = out.replace(rx, to);
+  if (site && site.length >= 4) out = out.split(site).join("<site>");
+  return out;
+}
+
+// The site's hostname from the status file's url ("https://host"), or ""
+function siteHost(status) {
+  try {
+    return status?.url ? new URL(status.url).hostname : "";
+  } catch {
+    return "";
+  }
+}
+
+// Follows a growing log file: the end of it at first, then what is added. A file that shrank, or was replaced (a new
+// inode), is read again from its start (rotation, truncation, the build transcript rewritten per build). A file that
+// grew by more than maxBytes since the last poll is read from maxBytes before its end, and the skip is reported.
+class LogTail {
+  constructor(fsp, file, initialBytes = 256 * 1024, maxBytes = 1024 * 1024) {
+    this.fsp = fsp;
+    this.file = file;
+    this.initialBytes = initialBytes;
+    this.maxBytes = maxBytes;
+    this.offset = -1;
+    this.ino = 0;
+    this.rest = "";
+    this.dropNext = false;
+  }
+
+  async poll() {
+    let st;
+    try {
+      st = await this.fsp.stat(this.file);
+    } catch {
+      return { lines: [], missing: true, restarted: false, skipped: 0 };
+    }
+    const ino = Number(st.ino) || 0;
+    let restarted = false;
+    let dropFirst = false; // reading from the middle of the file: its first line is cut
+    if (this.offset < 0) {
+      this.offset = Math.max(0, st.size - this.initialBytes);
+      dropFirst = this.offset > 0;
+      this.ino = ino;
+    } else if (st.size < this.offset || (ino && this.ino && ino !== this.ino)) {
+      this.offset = 0;
+      this.ino = ino;
+      this.rest = "";
+      this.dropNext = false;
+      restarted = true;
+    }
+    let skipped = 0;
+    if (st.size - this.offset > this.maxBytes) {
+      skipped = st.size - this.maxBytes - this.offset;
+      this.offset = st.size - this.maxBytes;
+      this.rest = "";
+      dropFirst = true;
+    }
+    const length = st.size - this.offset;
+    if (length <= 0) return { lines: [], missing: false, restarted, skipped };
+    const buf = Buffer.alloc(length);
+    let got = 0;
+    const fh = await this.fsp.open(this.file, "r");
+    try {
+      while (got < length) {
+        const { bytesRead } = await fh.read(buf, got, length - got, this.offset + got);
+        if (bytesRead <= 0) break;
+        got += bytesRead;
+      }
+    } finally {
+      await fh.close();
+    }
+    this.offset += got;
+    const parts = (this.rest + buf.toString("utf8", 0, got)).split(/\r?\n/);
+    this.rest = parts.pop() ?? ""; // a line still being written
+    if (dropFirst || this.dropNext) {
+      this.dropNext = parts.length === 0; // the cut line has not ended yet: drop it when it does
+      parts.shift();
+    }
+    if (this.rest.length > 64 * 1024) this.rest = this.rest.slice(-64 * 1024);
+    return { lines: parts.filter((l) => l.trim()), missing: false, restarted, skipped };
+  }
+}
+
+// Keeps at most `max` items, dropping the oldest
+function pushCapped(list, items, max) {
+  list.push(...items);
+  if (list.length > max) list.splice(0, list.length - max);
+}
+
+// The pane itself: source, follow, wrap, filter, copy; polling only while it is mounted (the settings tab is open)
+class LogPane {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.timer = null;
+    this.tails = {};
+    this.lines = {}; // source -> redacted lines (each source capped)
+    this.polling = false;
+  }
+
+  local(key, fallback) {
+    const v = this.app.loadLocalStorage(`ignis-control-log-${key}`);
+    return v === null || v === undefined ? fallback : v;
+  }
+
+  mount(parent) {
+    const files = this.plugin.logFiles();
+    this.files = files;
+    this.source = LOG_SOURCES.some(([v]) => v === this.local("source", "all")) ? this.local("source", "all") : "all";
+    this.follow = this.local("follow", "1") === "1";
+    this.wrap = this.local("wrap", "1") === "1";
+    this.filter = "";
+
+    const wrap = parent.createDiv({ cls: "ignis-logpane" });
+    const bar = wrap.createDiv({ cls: "ignis-logbar" });
+
+    const select = bar.createEl("select", { cls: "dropdown", attr: { "aria-label": "Which log to show" } });
+    for (const [value, label] of LOG_SOURCES) select.createEl("option", { value, text: label });
+    select.value = this.source;
+    select.addEventListener("change", () => {
+      this.source = select.value;
+      this.app.saveLocalStorage("ignis-control-log-source", this.source);
+      this.renderAll();
+    });
+
+    const filter = bar.createEl("input", { type: "search", cls: "ignis-logfilter", attr: { placeholder: "Filter…", "aria-label": "Show only lines containing" } });
+    filter.addEventListener("input", () => {
+      this.filter = filter.value.trim().toLowerCase();
+      this.renderAll();
+    });
+
+    const toggle = (label, on, change) => {
+      const l = bar.createEl("label", { cls: "ignis-logopt" });
+      const cb = l.createEl("input", { type: "checkbox" });
+      cb.checked = on;
+      l.appendText(` ${label}`);
+      cb.addEventListener("change", () => change(cb.checked));
+    };
+    toggle("Follow new lines", this.follow, (on) => {
+      this.follow = on;
+      this.app.saveLocalStorage("ignis-control-log-follow", on ? "1" : "0");
+      if (on) this.scrollToEnd(true);
+    });
+    toggle("Wrap lines", this.wrap, (on) => {
+      this.wrap = on;
+      this.app.saveLocalStorage("ignis-control-log-wrap", on ? "1" : "0");
+      this.applyWrap();
+      this.scrollToEnd();
+    });
+
+    const copy = bar.createEl("button", { cls: "clickable-icon", attr: { "aria-label": "Copy the lines shown" } });
+    setIcon(copy, "copy");
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(this.shown().join("\n"));
+        new Notice("Ignis: log copied (secret-looking values are hidden). Check it for paths before sharing it.");
+      } catch (e) {
+        new Notice(`Ignis: could not copy the log (${e.message}).`);
+      }
+    });
+
+    this.box = wrap.createDiv({ cls: "ignis-logview", attr: { tabindex: "0", role: "log", "aria-live": "off" } });
+    this.where = wrap.createDiv({ cls: "ignis-logsource" });
+    this.applyWrap();
+    this.renderAll();
+
+    const tick = () => this.poll();
+    this.timer = window.setInterval(tick, LOG_POLL_MS);
+    this.plugin.registerInterval(this.timer); // also cleared if the plugin unloads with the tab open
+    tick();
+  }
+
+  unmount() {
+    if (this.timer !== null) window.clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  fileFor(source) {
+    return source === "build" ? this.files.build : this.files.main;
+  }
+
+  async poll() {
+    if (this.polling || this.timer === null) return;
+    this.polling = true;
+    try {
+      for (const key of ["main", "build"]) {
+        const file = this.files[key];
+        if (!file) continue;
+        if (key === "build" && this.source !== "build" && !this.tails.build) continue; // read only once asked for
+        const tail = (this.tails[key] ??= new LogTail(fs.promises, file));
+        const r = await tail.poll();
+        const added = [];
+        if (r.restarted) added.push(`(${path.basename(file)} started again from its beginning: it was replaced or emptied)`);
+        if (r.skipped) added.push(`(${r.skipped} bytes skipped: the log grew faster than the pane reads it)`);
+        const site = siteHost(this.plugin.status);
+        added.push(...r.lines.map((l) => redactLine(l, site)));
+        if (key === "build") {
+          if (r.restarted) this.lines.build = [];
+          this.add("build", added);
+        } else {
+          this.add("all", added);
+          const by = {};
+          for (const l of added) (by[lineSource(l)] ??= []).push(l);
+          for (const [s, ls] of Object.entries(by)) this.add(s, ls);
+        }
+        tail.missing = r.missing;
+      }
+      this.showWhere();
+    } catch (e) {
+      this.where?.setText(`Could not read the log: ${e.message}`);
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  add(source, lines) {
+    if (!lines.length) return;
+    pushCapped((this.lines[source] ??= []), lines, LOG_MAX_LINES);
+    if (source !== this.source) return;
+    const shown = lines.filter((l) => this.matches(l));
+    if (!shown.length) return;
+    this.box.querySelector(".ignis-logempty")?.remove();
+    for (const l of shown) this.lineEl(l);
+    while (this.box.childElementCount > LOG_MAX_LINES) this.box.firstElementChild?.remove();
+    this.scrollToEnd();
+  }
+
+  matches(line) {
+    return !this.filter || line.toLowerCase().includes(this.filter);
+  }
+
+  shown() {
+    return (this.lines[this.source] ?? []).filter((l) => this.matches(l)).slice(-LOG_MAX_LINES);
+  }
+
+  lineEl(line) {
+    this.box.createDiv({ cls: `ignis-logline is-${lineLevel(line)}`, text: line });
+  }
+
+  renderAll() {
+    if (!this.box) return;
+    if (this.source === "build" && !this.tails.build) this.poll();
+    this.box.empty();
+    const lines = this.shown();
+    for (const l of lines) this.lineEl(l);
+    if (!lines.length) this.box.createDiv({ cls: "ignis-logempty", text: this.filter ? "No line matches the filter." : "No lines yet." });
+    this.showWhere();
+    this.scrollToEnd(true);
+  }
+
+  showWhere() {
+    const file = this.fileFor(this.source);
+    if (!file) {
+      this.where.setText(this.source === "build" ? "The vault's folder is not known." : "The Ignis folder is not known on this device: set it under This panel.");
+      return;
+    }
+    const tail = this.tails[this.source === "build" ? "build" : "main"];
+    const n = (this.lines[this.source] ?? []).length;
+    this.where.setText(tail?.missing ? `${file}: not there yet` : `${file} (${n} line${n === 1 ? "" : "s"} kept, at most ${LOG_MAX_LINES})`);
+  }
+
+  applyWrap() {
+    this.box.toggleClass("is-wrap", this.wrap);
+    this.box.toggleClass("is-nowrap", !this.wrap);
+  }
+
+  scrollToEnd(force = false) {
+    if (this.box && (force || this.follow)) this.box.scrollTop = this.box.scrollHeight;
+  }
+}
+
+// for the tests in test/ (plain Node, with Obsidian's module stubbed)
+module.exports.forTests = { isLauncherImage, imageFromTasklist, tasklistPath, checkLauncherProcess,
+  lineSource, lineLevel, redactLine, siteHost, LogTail, pushCapped, LOG_MAX_LINES };

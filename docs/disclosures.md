@@ -116,8 +116,13 @@ their full path in `%SystemRoot%\System32`:
 | --- | --- | --- |
 | `%LOCALAPPDATA%\Ignis Control\location.json` | Read | Where the launcher is installed and which Python runs it, written by the launcher, so no path travels in the vault |
 | `<Ignis folder>\status.json` | Read, every 2 s by default | The launcher's live status, for the status bar dot and the panel |
-| `<Ignis folder>\ignis.log` | Read, its last 48 KB, only while **Live log** is open | The live log (lines that look like tokens are hidden) |
+| `<Ignis folder>\ignis.log` | Read with Node's `fs`: its last 256 KB, then what is added, once a second, only while the plugin's settings tab is open | The **Log** pane. Tokens, Cloudflare team names, AUD tags, e-mail addresses, the site's hostname and other secret-looking values are hidden before a line is kept or shown |
+| `<vault>\LaTeX\compiled\.ignis-build.log` | Read the same way, only when **Last LaTeX build's transcript** is chosen in the **Log** pane | The transcript the launcher writes for a LaTeX build through Ignis |
 | `<Ignis folder>\data\server-settings.json` | Read; written on **Apply and restart** | Ignis's server options |
+
+The **Log** pane's **Copy** button writes the lines shown (already redacted) to the clipboard when you select it;
+the plugin never reads the clipboard. Its choices (source, follow, wrap) are kept on each device in Obsidian's local
+storage.
 
 Inside the vault it writes `.obsidian/ignis-disabled-plugins.json`, `.obsidian/ignis-diagnostics.json` and its own
 `data.json`.

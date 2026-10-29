@@ -144,6 +144,9 @@ Meanings and other keys: [Ignis settings](https://ignis.thiefling.com/docs/using
 | Ignis folder | This device only: Obsidian local storage `ignis-control-ignisDir` | `ignis_dir` from `location.json` | The installation's `ignis\` folder |
 | Python | This device only: `ignis-control-python` | `python` from `location.json` | Absolute path to `python.exe` or `pythonw.exe` with `pywin32` and `psutil` |
 | Launcher script | This device only: `ignis-control-launcher` | `<Ignis folder>\ignis_native.py` | Set only if the launcher is elsewhere |
+| Log: source | This device only: `ignis-control-log-source` | Everything (`ignis.log`) | Which log, or which part of `ignis.log`, the **Log** pane shows |
+| Log: Follow new lines | This device only: `ignis-control-log-follow` | On | Keep the newest line in view |
+| Log: Wrap lines | This device only: `ignis-control-log-wrap` | On | Off: whole lines and a horizontal scrollbar |
 
 The three device settings are never stored in the vault's `data.json`. The vault is shared with every device and with
 the browser, and a path in it could choose the program desktop Obsidian runs.
