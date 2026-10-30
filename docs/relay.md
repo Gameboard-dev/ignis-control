@@ -82,12 +82,14 @@ Paths are relative to `/relay/<service>`: `GET /health` for `augmented-view` is 
 | Service | Destination | Allowed requests | Refused requests |
 | --- | --- | --- | --- |
 | `augmented-view` | `127.0.0.1:<port>`; `IGNIS_AUGMENTED_VIEW_PORT` from the launcher's environment or `ignis\.env`, default 8790 (never the vault's `data.json`) | `GET /health`, `GET /stats`, `POST /emphasis`, `POST /claims` | Everything else, including `POST /shutdown` and `GET /docs` |
+| `quarry` | `127.0.0.1:<port>`; `IGNIS_QUARRY_PORT` from the launcher's environment or `ignis\.env`, default 8766 (never the vault's `data.json`) | The library, search, themes, citation trees, exclusions and credibility, indexing, and the review's reading and task-control tools ([the list](Plugin-Integration/Quarry.md#scope)); `POST /queue` without its `vault` and `config_dir` fields | Everything else, including the settings, keys, `POST /shutdown` and every assistant tool that writes |
 | `latex` | The launcher's build | `GET /status`, `POST /compile`, each with a valid Cloudflare Access token | Everything else under `/relay/latex/` (404); any request without a valid token (403) |
 
 Per-service detail:
 
 - `augmented-view`: [Plugin-Integration/Augmented-View.md](Plugin-Integration/Augmented-View.md).
 - `latex`: [Plugin-Integration/LaTeX.md](Plugin-Integration/LaTeX.md).
+- `quarry`: [Plugin-Integration/Quarry.md](Plugin-Integration/Quarry.md).
 
 A service's port never comes from the vault: the browser can write every file in it, so a port read from there could
 point the relay at any service on the PC. Each port comes from the launcher's own settings (its environment or

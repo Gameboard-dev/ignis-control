@@ -25,7 +25,7 @@ publishes it on the internet, so it assumes:
 | The PC from the LAN | Direct connections to Ignis | Ignis listens on `127.0.0.1` inside the container, and Windows drops connections into an AppContainer |
 | The PC from the internet | Open ports | None. cloudflared opens the tunnel outbound |
 | Desktop services | Requests that change settings, reveal keys or stop the service | Per-service allowlists in the launcher ([relay.md](relay.md#services)) |
-| Other services on the PC | The relay redirected to them by a changed port setting | Ports come from the launcher's environment or `ignis\.env` (`IGNIS_AUGMENTED_VIEW_PORT`, default 8790), never from the vault's `data.json`; a port that is another known service's is refused ([relay.md](relay.md#services)) |
+| Other services on the PC | The relay redirected to them by a changed port setting | Ports come from the launcher's environment or `ignis\.env` (`IGNIS_AUGMENTED_VIEW_PORT`, default 8790; `IGNIS_QUARRY_PORT`, default 8766), never from the vault's `data.json`; a port that is another known service's is refused ([relay.md](relay.md#services)) |
 | The relay | Use by another website | The Ignis server refuses an `Origin` that is neither this host nor in `WS_ORIGINS` |
 | Cookies and Access tokens | Leaking to desktop services | The Ignis server forwards only seven listed headers; the Access token goes only to `latex` |
 | The tunnel token | Theft from a file or the log | Kept in Credential Manager ([below](#the-tunnel-token)) |

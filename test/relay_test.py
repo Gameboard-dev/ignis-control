@@ -114,7 +114,7 @@ def other_services_refused(tmp: Path) -> None:
         del n.OTHER_PORTS["another local service"]
 
     # two relayed services on one port: both refused, since neither is known to be right
-    other_port = 8766
+    other_port = 8767  # not a relayed service's default (Quarry's is 8766)
     saved = dict(n.SERVICES)
     n.SERVICES["other-service"] = (lambda: other_port, lambda m, p: (m, p) == ("GET", "/health"))
     try:
@@ -182,6 +182,58 @@ def request_body(tmp: Path) -> None:
     assert conn.out.startswith(b"HTTP/1.1 403"), conn.out
     assert len(seen) == before, "a refused request reached the service"
     server.shutdown()
+
+
+def quarry_routes() -> None:
+    """Quarry's list: the library, search, themes, the review's reading tools and indexing pass; the settings, keys,
+    the GPU hold, stopping, archiving and the assistant's writing tools are refused, as are tricks on the paths."""
+    for ok in [("GET", "/quarry/health"), ("GET", "/quarry/events?since=3"), ("POST", "/quarry/search"),
+               ("GET", "/quarry/library"), ("GET", "/quarry/credibility?key=ABCD1234"), ("POST", "/quarry/exclusions"),
+               ("GET", "/quarry/themes"), ("GET", "/quarry/themes/12"), ("POST", "/quarry/themes/rebuild"),
+               ("POST", "/quarry/citation-tree"), ("POST", "/quarry/queue"), ("POST", "/quarry/queue/cancel"),
+               ("POST", "/quarry/assistant/review_progress"), ("POST", "/quarry/assistant/task_control")]:
+        where = n.route_local(*ok)[0]
+        assert where is not None and where[0] == n.QUARRY_DEFAULT_PORT, ok
+    assert n.route_local("GET", "/quarry/themes/12?limit=5")[0][1] == "/themes/12?limit=5"
+    for refused in [("GET", "/quarry/settings"), ("POST", "/quarry/settings"), ("GET", "/quarry/keys"),
+                    ("POST", "/quarry/keys"), ("POST", "/quarry/keys/check"), ("POST", "/quarry/shutdown"),
+                    ("POST", "/quarry/gpu/release"), ("POST", "/quarry/queue/gpu"), ("POST", "/quarry/archive-source"),
+                    ("POST", "/quarry/zotero-web"), ("GET", "/quarry/assistant"),
+                    ("POST", "/quarry/assistant/archive_sources"), ("POST", "/quarry/assistant/retrieve_paper"),
+                    ("POST", "/quarry/assistant/write_section"), ("POST", "/quarry/assistant/"),
+                    ("GET", "/quarry/themes/1x"), ("GET", "/quarry/themes/\u0663"), ("POST", "/quarry/health"),
+                    ("DELETE", "/quarry/exclusions"), ("GET", "/quarry/../augmented-view/health"),
+                    ("GET", "/quarry//health"), ("GET", "/quarry"), ("GET", "/Quarry/health")]:
+        assert n.route_local(*refused)[0] is None, refused
+
+
+def quarry_queue_body(tmp: Path) -> None:
+    """POST /queue through the relay: the task arrives, the folder fields do not; a body that cannot be read whole as
+    JSON is refused before it reaches the service."""
+    server, port = stand_in()
+    settings(tmp, f"IGNIS_QUARRY_PORT={port}\n")
+    body = json.dumps({"task": "update", "vault": "C:\\Users\\x\\Other", "config_dir": ".obsidian"}).encode()
+    conn = FakeConn(b"POST /quarry/queue HTTP/1.1\r\nHost: relay\r\nContent-Type: application/json\r\n"
+                    b"Authorization: Bearer t\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    n.relay_one(conn, n.route_local)  # type: ignore[arg-type]
+    assert b"200" in conn.out.split(b"\r\n")[0], conn.out
+    assert seen[-1][:3] == (port, "POST", "/queue") and json.loads(seen[-1][3]) == {"task": "update"}, seen[-1]
+
+    before = len(seen)
+    for bad in [b"Content-Length: 5\r\n\r\nnot j", b"Transfer-Encoding: chunked\r\n\r\n5\r\n{}\r\n0\r\n\r\n",
+                b"\r\n{}", b"Content-Length: 2\r\n\r\n[]", b"Content-Length: 99\r\n\r\n{}",
+                b"Content-Length: " + str(n.BODY_LIMIT + 1).encode() + b"\r\n\r\n{}"]:
+        conn = FakeConn(b"POST /quarry/queue HTTP/1.1\r\n" + bad)
+        n.relay_one(conn, n.route_local)  # type: ignore[arg-type]
+        assert conn.out.startswith(b"HTTP/1.1 400"), (bad, conn.out)
+    assert len(seen) == before, "a refused body reached the service"
+    # another request passes its body untouched (no filter)
+    search = b'{"vault": "x"}'
+    conn = FakeConn(b"POST /quarry/search HTTP/1.1\r\nContent-Length: " + str(len(search)).encode() + b"\r\n\r\n" + search)
+    n.relay_one(conn, n.route_local)  # type: ignore[arg-type]
+    assert seen[-1][2:] == ("/search", search), seen[-1]
+    server.shutdown()
+    settings(tmp, "")
 
 
 def ignored(lines: list[str], path: str) -> bool:
@@ -281,6 +333,7 @@ def tunnel() -> None:
 def main() -> None:
     n.log = lambda *a, **k: None  # type: ignore[assignment]
     os.environ.pop("IGNIS_AUGMENTED_VIEW_PORT", None)
+    os.environ.pop("IGNIS_QUARRY_PORT", None)
     for name in ("IGNIS_ACCESS_TEAM", "IGNIS_ACCESS_AUD", "IGNIS_ACCESS_EMAILS"):
         os.environ.pop(name, None)
     with tempfile.TemporaryDirectory() as t:
@@ -290,11 +343,13 @@ def main() -> None:
         powershell_values()
         tunnel()
         routes()
+        quarry_routes()
         ignored_paths()
         vault_cannot_redirect(tmp)
         other_services_refused(tmp)
         dotenv_and_access(tmp)
         request_body(tmp)
+        quarry_queue_body(tmp)
     print("relay: all checks passed")
 
 
