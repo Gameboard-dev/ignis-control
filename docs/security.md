@@ -60,6 +60,9 @@ publishes it on the internet, so it assumes:
   service token instead of a person.
 - After login, Cloudflare adds a signed JSON Web Token to every request, in the header `Cf-Access-Jwt-Assertion` and
   the cookie `CF_Authorization`. The Ignis server forwards the header only to `latex`, and the cookie to no service.
+- Quarry's service has a second lock of its own: a token, sent by Quarry in the browser as `Authorization: Bearer`
+  (it is pasted once into Quarry's settings in the browser). The Ignis server forwards `Authorization` only to
+  `quarry`; the launcher passes it on and the log pane hides it.
 
 ### How the LaTeX build verifies the token
 

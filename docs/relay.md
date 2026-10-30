@@ -48,8 +48,10 @@ The route is mounted at `/relay` before Ignis's body parsers and compression, so
 
 **Request headers passed to the launcher.** Only these: `accept`, `accept-language`, `content-type`,
 `content-length`, `last-event-id`, `cache-control`, `user-agent`. For the service `latex` only, also
-`cf-access-jwt-assertion`. Everything else stays in Ignis: cookies (including `CF_Authorization`), `Authorization`,
-the Access token for every other service, and forwarding headers. `Host` is set to `relay` and `Connection` to
+`cf-access-jwt-assertion`. For the service `quarry` only, also `authorization`: Quarry's own service token
+(`Bearer <token>`), which Quarry's service checks on every request since 2026-10-30. Everything else stays in Ignis:
+cookies (including `CF_Authorization`), `Authorization` for every other service, the Access token for every other
+service, and forwarding headers. `Host` is set to `relay` and `Connection` to
 `close`.
 
 **Answer headers.** All headers from the launcher are passed back except `Connection`. Headers are sent at once, so
