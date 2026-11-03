@@ -87,6 +87,8 @@ function redaction() {
     ["TUNNEL_TOKEN=abcdefghijklmnopqrstuvwxyz0123", (o) => o === "TUNNEL_TOKEN=<hidden>"],
     ["Cf-Access-Jwt-Assertion: abc.def.ghi", (o) => o === "Cf-Access-Jwt-Assertion: <hidden>"],
     ["cookie: CF_Authorization=secretvalue; other=1", (o) => o === "cookie: <hidden>"],
+    // Quarry's service token, which the relay passes on to Quarry (patches/0006-relay.patch)
+    [`Authorization: Bearer ${"0f".repeat(32)}`, (o) => o === "Authorization: <hidden>"],
     ["issuer https://myteam-4f8a.cloudflareaccess.com/cdn-cgi", (o) => o === "issuer https://<team>.cloudflareaccess.com/cdn-cgi"],
     [`aud ${"a1b2c3d4".repeat(8)} ok`, (o) => o === "aud <hex> ok"],
     ["password: hunter2hunter2", (o) => o === "password: <hidden>"],

@@ -68,6 +68,7 @@ A line in `.env` is the simplest; for a **user** environment variable, which the
 | --- | --- | --- |
 | `IGNIS_VAULT` | `<root>\vault` | The vault's folder. A symbolic link is resolved to its target. Read at launcher start. If the folder does not exist, `setup`, `check`, `repair` and `run` stop with an error naming `IGNIS_VAULT` |
 | `IGNIS_AUGMENTED_VIEW_PORT` | `8790` | The port of Augmented View's server on this PC (the server's `--port`; the plugin's **Port** setting on desktop). Set it only if you changed that setting. Read at every relay request |
+| `IGNIS_QUARRY_PORT` | `8766` | The port of Quarry's service on this PC (Quarry's **Port** setting on desktop). Set it only if you changed that setting. Read at every relay request |
 | `IGNIS_IGNORED_PATHS` | `/LaTeX/compiled/*,!/LaTeX/compiled/main.pdf,!/LaTeX/compiled/main.shown.pdf,!/LaTeX/compiled/main.synctex.gz,!/LaTeX/compiled/latex-status.json` | Paths Ignis does not watch, as gitignore patterns, comma-separated. Replaces the default; it is not added to it. Passed to Ignis as `IGNORED_PATHS`. Ignored files are still listed in the file tree each tab downloads, but with the size and time they had when Ignis listed the vault: a browser never learns that they changed. So the LaTeX build folder's contents are ignored except the four files a browser needs (the PDF, the copy the LaTeX plugin's pane shows, the SyncTeX file, and the plugin's `latex-status.json`); ignoring the whole folder left the old PDF on screen, even after a reload. Add folders that change constantly and that no browser needs, such as a sync plugin's cache, after the default. Read at launcher start |
 | `IGNIS_CONTAINER_PREFIX` | `ignis-control` | The prefix of every name the installation uses in Windows ([Names in Windows](#names-in-windows)). Letters, digits, `.` and `-`, at most 40 characters; anything else stops the launcher with the reason. Changing it on an installation means a new sandbox: run `setup` and `set-token` again |
 | `IGNIS_EXTRA_CA_CERT` | `<root>\ignis\runtime\extra-ca.pem` | An extra root certificate (PEM) for Ignis's Node, passed as `NODE_EXTRA_CA_CERTS` when the file exists ([installation.md](installation.md#https-scanning-antivirus)). The sandbox must be able to read it, so keep it in `runtime\` |
@@ -169,9 +170,10 @@ in it, including the plugins' `data.json`).
 | Service | Source | Key | Default |
 | --- | --- | --- | --- |
 | `augmented-view` | The launcher's environment, else `<root>\ignis\.env` | `IGNIS_AUGMENTED_VIEW_PORT` | 8790 |
+| `quarry` | The launcher's environment, else `<root>\ignis\.env` | `IGNIS_QUARRY_PORT` | 8766 |
 
 A port outside 1024–65535, or equal to 8080 or 18790, is replaced by the default. A port that is also another known
-service's (another relayed service, 8080 or 18790) is refused: the relay answers 403 and logs why. If you change Augmented View's **Port** on desktop, set `IGNIS_AUGMENTED_VIEW_PORT` to the same value.
+service's (another relayed service, 8080 or 18790) is refused: the relay answers 403 and logs why. If you change Augmented View's **Port** on desktop, set `IGNIS_AUGMENTED_VIEW_PORT` to the same value, and likewise `IGNIS_QUARRY_PORT` for Quarry's **Port**.
 
 ## Fixed values
 

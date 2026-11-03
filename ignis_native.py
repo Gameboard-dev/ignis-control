@@ -761,6 +761,48 @@ def augmented_view_port() -> int:
     return checked_port(config("IGNIS_AUGMENTED_VIEW_PORT"), AUGMENTED_VIEW_DEFAULT_PORT)
 
 
+# Quarry (Gameboard-dev/Quarry): its service on this PC, which desktop Obsidian starts. In the browser Quarry asks
+# /relay/quarry/<path> with the service's own token (Authorization: Bearer, which patches/0006-relay.patch passes to
+# this service only). The token is the service's lock; this list is the relay's: what a browser may do with the library
+# (search, the library and its credibility, exclusions, themes, citation trees, the review's progress and task
+# controls, starting or cancelling indexing). Refused: the settings (they hold paths), keys, the GPU hold, stopping the
+# service, archiving, and every assistant tool that writes or retrieves (docs/ignis.md in Quarry's repository).
+QUARRY_DEFAULT_PORT = 8766  # the service's own default (Settings, Service, Port)
+QUARRY_GET = {"/health", "/stats", "/events", "/library", "/exclusions", "/duplicates", "/credibility", "/citekeys",
+              "/bib", "/preprints", "/queue", "/stale", "/models", "/skills", "/hardware/recommend", "/zotero/ping",
+              "/zotero/check", "/themes", "/themes/"}
+QUARRY_POST = {"/search", "/similar", "/connections", "/citation-tree", "/exclusions", "/credibility/override", "/queue",
+               "/queue/cancel", "/themes/rebuild", "/themes/cancel"}
+# the assistant's tools the review pane uses that only read, or pause, resume or stop a task in the review's ledger
+QUARRY_TOOLS = {"review_open", "review_progress", "list_tasks", "task_control", "retrieval_status"}
+
+
+def quarry_port() -> int:
+    """The port of Quarry's service: IGNIS_QUARRY_PORT from the launcher's own settings (the environment or
+    ignis/.env), else the service's default; never the vault's data.json, for the reason augmented_view_port gives."""
+    return checked_port(config("IGNIS_QUARRY_PORT"), QUARRY_DEFAULT_PORT)
+
+
+def quarry_allows(method: str, path: str) -> bool:
+    """Whether a browser may make this request of Quarry's service (QUARRY_GET, QUARRY_POST, QUARRY_TOOLS; a theme by
+    its number)."""
+    if method == "GET":
+        return path in QUARRY_GET or (path.startswith("/themes/") and path[len("/themes/"):].isdigit()
+                                      and path[len("/themes/"):].isascii())
+    if method == "POST":
+        tool = path[len("/assistant/"):] if path.startswith("/assistant/") else None
+        return path in QUARRY_POST or tool in QUARRY_TOOLS
+    return False
+
+
+def quarry_queue(body: Any) -> Any:
+    """POST /queue's body without `vault` and `config_dir`: a request from the browser may start a task, never point
+    the service at another folder (the vault every new note and every assistant tool writes to)."""
+    if not isinstance(body, dict):
+        raise ValueError("the body is not a JSON object")
+    return {k: v for k, v in body.items() if k not in ("vault", "config_dir")}
+
+
 def checked_port(value: Any, default: int) -> int:
     """A port from a settings file, or the default when it is not one a service of ours would use."""
     try:
@@ -1085,7 +1127,14 @@ LOCAL_RELAY_PIPE = rf"\\.\pipe\{PREFIX}-ignis-relay"
 # service -> (its port, which requests pass)
 SERVICES: dict[str, tuple[Callable[[], int], Callable[[str, str], bool]]] = {
     "augmented-view": (augmented_view_port, lambda m, p: (m, p) in AUGMENTED_VIEW_ALLOWED),
+    "quarry": (quarry_port, quarry_allows),
 }
+# (service, method, path) -> the JSON body as the service receives it: a request whose body must be read before it
+# passes (at most BODY_LIMIT bytes, with a Content-Length), so that a field the browser must not set is taken out
+BODY_FILTERS: dict[tuple[str, str, str], Callable[[Any], Any]] = {
+    ("quarry", "POST", "/queue"): quarry_queue,
+}
+BODY_LIMIT = 1 << 20
 # Other services on this PC that no relayed service's requests may be sent to (the relayed services' own ports are
 # checked against each other as well): Ignis itself and the forwarder in the sandbox.
 OTHER_PORTS = {"Ignis": PORT, "the Augmented View forwarder": RELAY_PORT}
@@ -1188,6 +1237,28 @@ def http_error(status: str, message: str) -> bytes:
 Route = Callable[[str, str], tuple[Optional[tuple[int, str]], str]]
 
 
+def filtered_body(conn: PipeConnection, headers: list[str], rest: bytes, body_filter: Callable[[Any], Any]) -> tuple[Optional[bytes], str]:
+    """The whole request body (its Content-Length, at most BODY_LIMIT; no chunked encoding), read as JSON and put
+    through `body_filter`; or None and why."""
+    lengths = [h.split(":", 1)[1].strip() for h in headers if h.lower().startswith("content-length:")]
+    if any(h.lower().startswith("transfer-encoding:") for h in headers) or len(lengths) != 1 or not lengths[0].isdigit():
+        return None, "this request needs a single Content-Length (no chunked body)"
+    length = int(lengths[0])
+    if length > BODY_LIMIT:
+        return None, f"the body is larger than {BODY_LIMIT} bytes"
+    body = rest
+    while len(body) < length:
+        chunk = conn.read()
+        if not chunk:
+            return None, "the body ended early"
+        body += chunk
+    try:
+        out = body_filter(json.loads(body[:length].decode("utf-8")))
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, f"the body is not JSON for this request ({e})"
+    return json.dumps(out).encode("utf-8"), ""
+
+
 def relay_one(conn: PipeConnection, route: Route = route_augmented_view) -> None:
     """One request: `route` says whether it passes and to which port and path; the request goes to that service on
     this PC and the answer streams back."""
@@ -1215,6 +1286,18 @@ def relay_one(conn: PipeConnection, route: Route = route_augmented_view) -> None
         conn.close()
         return
     port, own = where
+    service = target.lstrip("/").partition("/")[0] if route is route_local else ""
+    body_filter = BODY_FILTERS.get((service, method, own.split("?")[0]))
+    if body_filter is not None:
+        filtered, why = filtered_body(conn, headers, rest, body_filter)
+        if filtered is None:
+            log(f"relay: refused {method} {path}: {why}")
+            relay_counted("refused", f"{method} {path}")
+            conn.write(http_error("400 Bad Request", why))
+            conn.close()
+            return
+        headers = [h for h in headers if not h.lower().startswith("content-length:")] + [f"Content-Length: {len(filtered)}"]
+        rest = filtered
     request_line = f"{method} {own} HTTP/1.1"
     # One request per connection: the server closes after answering, which ends both directions
     # the Origin was checked by Ignis's server (WS_ORIGINS) before the request reached the pipe; it is dropped, so the
@@ -1230,8 +1313,8 @@ def relay_one(conn: PipeConnection, route: Route = route_augmented_view) -> None
     sock.settimeout(None)
     relay_counted("passed", f"{method} {path}")
 
-    def upload() -> None:  # the rest of the request body, if any
-        while chunk := conn.read():
+    def upload() -> None:  # the rest of the request body, if any (none left when a filter read it all)
+        while body_filter is None and (chunk := conn.read()):
             try:
                 sock.sendall(chunk)
             except OSError:

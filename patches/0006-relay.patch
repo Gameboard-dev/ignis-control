@@ -15,7 +15,7 @@ diff --git a/apps/ignis-server/server/routes/local-relay.js b/apps/ignis-server/
 new file mode 100644
 --- /dev/null
 +++ b/apps/ignis-server/server/routes/local-relay.js
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,82 @@
 +// local patch 0006: the same-origin relay to services on the computer that runs Ignis.
 +//
 +// A plugin in the browser asks `<this page's origin>/relay/<service>/<path>`; this route streams the request, and the
@@ -32,12 +32,15 @@ new file mode 100644
 +const FORWARDED = new Set(["accept", "accept-language", "content-type", "content-length", "last-event-id", "cache-control", "user-agent"]);
 +// the LaTeX build alone gets Cloudflare Access's token, which the launcher verifies before it builds (2026-10-28)
 +const TOKEN_FOR = new Set(["latex"]);
++// Quarry's service checks a token of its own, `Authorization: Bearer` (2026-10-30): passed on to it and to no other
++// service; every other credential of the browser stays here
++const AUTHORIZATION_FOR = new Set(["quarry"]);
 +
 +function forwardedHeaders(headers, service = "") {
 +  const out = {};
 +  for (const [k, v] of Object.entries(headers || {})) {
 +    const key = k.toLowerCase();
-+    if (FORWARDED.has(key) || (key === "cf-access-jwt-assertion" && TOKEN_FOR.has(service))) out[key] = v;
++    if (FORWARDED.has(key) || (key === "cf-access-jwt-assertion" && TOKEN_FOR.has(service)) || (key === "authorization" && AUTHORIZATION_FOR.has(service))) out[key] = v;
 +  }
 +  out.host = "relay";
 +  out.connection = "close";
@@ -99,7 +102,7 @@ diff --git a/apps/ignis-server/server/routes/local-relay.test.mjs b/apps/ignis-s
 new file mode 100644
 --- /dev/null
 +++ b/apps/ignis-server/server/routes/local-relay.test.mjs
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,108 @@
 +import { describe, it, expect, afterEach } from "vitest";
 +import { createRequire } from "module";
 +import http from "node:http";
@@ -192,5 +195,19 @@ new file mode 100644
 +
 +  it("forwards only the headers a service needs", () => {
 +    expect(forwardedHeaders({ Cookie: "a", Authorization: "b", "cf-access-jwt-assertion": "c", "Content-Type": "x", "Last-Event-ID": "4" })).toEqual({ "content-type": "x", "last-event-id": "4", host: "relay", connection: "close" });
++    // each credential reaches only the service that checks it: Access's token the LaTeX build, the bearer token Quarry
++    const all = { Cookie: "a", Authorization: "Bearer t", "cf-access-jwt-assertion": "c" };
++    expect(forwardedHeaders(all, "quarry")).toEqual({ authorization: "Bearer t", host: "relay", connection: "close" });
++    expect(forwardedHeaders(all, "latex")).toEqual({ "cf-access-jwt-assertion": "c", host: "relay", connection: "close" });
++    expect(forwardedHeaders(all, "other")).toEqual({ host: "relay", connection: "close" });
++  });
++
++  it("passes Quarry's token through the pipe, and no other service's", async () => {
++    const { pipe, seen } = await fakeLauncher((req, res) => res.end("x"));
++    const base = await ignis(pipe);
++    await fetch(`${base}/relay/quarry/health`, { headers: { authorization: "Bearer abc" } });
++    await fetch(`${base}/relay/latex/build`, { headers: { authorization: "Bearer abc" } });
++    expect(seen[0].headers.authorization).toBe("Bearer abc");
++    expect(seen[1].headers.authorization).toBeUndefined();
 +  });
 +});
