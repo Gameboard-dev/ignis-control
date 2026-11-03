@@ -321,7 +321,8 @@ def tunnel() -> None:
         assert proto == "" and "IGNIS_TUNNEL_PROTOCOL" in why, bad
     args = n.cloudflared_args("http2")
     assert args[args.index("--protocol") + 1] == "http2" and args.count("--protocol") == 1
-    assert args[1:] == ["tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "run"]
+    assert args[1:] == ["tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "run",
+                        "--dns-resolver-addrs", "1.1.1.1:53", "--dns-resolver-addrs", "1.0.0.1:53"]
     try:
         n.cloudflared_args("http2 --loglevel debug")
     except AssertionError:

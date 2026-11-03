@@ -701,10 +701,19 @@ def tunnel_protocol(value: Optional[str]) -> tuple[str, str]:
                 f"(in {IGNIS / '.env'} or the environment); the launcher does not start")
 
 
+# cloudflared's DNS resolver service (for DNS that Cloudflare WARP clients send through a tunnel; Ignis has none)
+# otherwise looks up region1.v2.argotunnel.com every 5 minutes with Go's own resolver, to learn which DNS server this
+# PC uses. That server is usually the router, on the local network, which the AppContainer may not reach (it has
+# internetClient only), so every lookup timed out: "ERR Failed to refresh DNS local resolver ... i/o timeout". Fixed
+# public addresses replace the lookup (--dns-resolver-addrs; cloudflared's ingress/origins/dns.go, 2026-11-03).
+TUNNEL_DNS_RESOLVERS = ("1.1.1.1:53", "1.0.0.1:53")
+
+
 def cloudflared_args(protocol: str) -> list[str]:
     """cloudflared's command line, as an argument list (no shell); `protocol` from tunnel_protocol."""
     assert protocol in TUNNEL_PROTOCOLS
-    return [str(CLOUDFLARED), "tunnel", "--no-autoupdate", "--protocol", protocol, "--edge-ip-version", "4", "run"]
+    dns = [a for addr in TUNNEL_DNS_RESOLVERS for a in ("--dns-resolver-addrs", addr)]
+    return [str(CLOUDFLARED), "tunnel", "--no-autoupdate", "--protocol", protocol, "--edge-ip-version", "4", "run", *dns]
 
 
 def tunnel_token() -> str:
