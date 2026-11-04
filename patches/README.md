@@ -19,6 +19,7 @@ them.
 | `0004-mobile.patch` | Asks the browser to keep the site's storage, so Obsidian's metadata index survives; keeps `.obsidian` files in the browser between visits while they are unchanged on the server | The server setting `persistentCacheBytes` (default 100 MB, 0 turns it off) |
 | `0005-startup.patch` | Builds Ignis's two browser bundles minified; writes readable copies to `packages/*/reference/`, which the server does not serve; adds the class `is-ignis` to the page | none |
 | `0006-relay.patch` | The same-origin relay `/relay/<service>/…`: streams requests through the named pipe named in `IGNIS_LOCAL_RELAY` to the launcher | `IGNIS_LOCAL_RELAY` (unset: every relay request gets 503) |
+| `0007-spawn.patch` | `child_process.spawn` of the Claude Code CLI, and only that program, through the relay's `claude` service, so the Claudian plugin works in a browser unchanged; with the `readline`, `string_decoder`, `async_hooks` and `module` shims it needs, virtual files made stat-able, and brotli (`POST /api/brotli`, which the plugin needs at load: its language files are brotli-compressed and pako does not do brotli) | none in Ignis; the launcher's `claude-setup` and `claude-login` ([Claudian.md](../docs/Plugin-Integration/Claudian.md)) |
 
 Patch 0003 also changes `local-plugins-guard.js`, which patch 0001 adds, so apply 0001 before 0003.
 

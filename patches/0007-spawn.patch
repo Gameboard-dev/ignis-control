@@ -1,0 +1,1532 @@
+diff --git a/apps/ignis-server/server/index.js b/apps/ignis-server/server/index.js
+index 40050b6..1fe77cc 100644
+--- a/apps/ignis-server/server/index.js
++++ b/apps/ignis-server/server/index.js
+@@ -11,6 +11,7 @@ const {
+   watcher,
+   writeCoalescer,
+   resolveVaultPath,
++  requestContext,
+ } = require("@ignis/server-core");
+ const {
+   BRIDGE_PLUGIN_ID,
+@@ -55,34 +56,196 @@ app.use((req, res, next) => {
+   next();
+ });
+ 
++// local patch 0006: the relay to services on this computer, before the body parsers and compression (it streams)
++app.use("/relay", require("./routes/local-relay").localRelay({ originAllowlist: settings.get("wsOrigins") }));
++
+ app.use(express.json({ limit: settings.MAX_BODY_BACKSTOP }));
+ app.use(compression());
+ 
+ // logger middleware
++//
++// Local patch (ZoteroSearch, 2026-10-27; ignis/patches/0003-diagnostics.patch): a failed request is logged with its
++// reason (the error's code and message, recorded by sanitizeError in requestContext, or the JSON error the route
++// sent) and its full, decoded path; batch-read lists the files it skipped and why. LOG_REQUESTS=errors logs only
++// failures, partial batch-reads and requests slower than SLOW_MS; NO_COLOR=1 leaves out the colour codes.
++const LOG_ERRORS_ONLY = process.env.LOG_REQUESTS === "errors";
++const PLAIN = Boolean(process.env.NO_COLOR);
++const SLOW_MS = 2000;
++
++function readableUrl(url) {
++  try {
++    return decodeURIComponent(url.replace(/\+/g, " "));
++  } catch {
++    return url;
++  }
++}
++
++function oneLine(s, max = 300) {
++  const t = String(s).replace(/\p{Cc}+/gu, " "); // control characters: one event, one line
++  return t.length > max ? t.slice(0, max) + "..." : t;
++}
++
+ app.use((req, res, next) => {
+   const start = Date.now();
+   const origEnd = res.end;
++  const origJson = res.json;
++  const store = {};
++
++  res.json = function (body) {
++    if (res.statusCode >= 400 && body && typeof body === "object") {
++      store.body = body;
++    }
++
++    return origJson.call(this, body);
++  };
+ 
+   res.end = function (...args) {
+     const duration = Date.now() - start;
+     const status = res.statusCode;
++    const skipped = store.skipped || [];
++    const failed = status >= 400;
++
++    if (!LOG_ERRORS_ONLY || failed || skipped.length || duration >= SLOW_MS) {
++      const color = PLAIN ? "" : status >= 500 ? ANSI_RED : status >= 400 ? ANSI_YELLOW : ANSI_GREEN;
++      const reset = PLAIN ? "" : ANSI_RESET;
++      let line = `${color}${req.method} ${status}${reset} ${oneLine(readableUrl(req.originalUrl), failed ? 300 : 120)} (${duration}ms)`;
++
++      if (failed) {
++        const e = store.error;
++        const message = e ? String(e.message || e) : "";
++        const code = e ? e.code || e.name || "error" : "";
++        const why = e
++          ? message.startsWith(code) ? message : `${code}: ${message}`
++          : store.body?.error || store.body?.message || "";
++
++        if (why) {
++          line += ` -- ${oneLine(why)}`;
++        }
++      }
++
++      if (skipped.length) {
++        line += ` -- skipped ${skipped.length}: ${oneLine(skipped.slice(0, 5).join(", "))}`;
++      }
++
++      console.log(line);
++    }
+ 
+-    const color =
+-      status >= 500 ? ANSI_RED : status >= 400 ? ANSI_YELLOW : ANSI_GREEN;
++    origEnd.apply(this, args);
++  };
+ 
+-    const path =
+-      req.originalUrl.length > 80
+-        ? req.originalUrl.slice(0, 80) + "..."
+-        : req.originalUrl;
++  requestContext.run(store, next);
++});
+ 
+-    console.log(
+-      `${color}${req.method} ${status}${ANSI_RESET} ${path} (${duration}ms)`,
+-    );
++// What browser tabs report about themselves (packages/shim/src/diagnostics.js, local patch 0003): one log line per
++// event, "client <session> ...". Each tab's session is introduced once with its device; at most CLIENT_BUDGET events
++// per session in CLIENT_WINDOW_MS are written, the rest counted.
++const CLIENT_BUDGET = 400;
++const CLIENT_WINDOW_MS = 5 * 60 * 1000;
++const clientSessions = new Map(); // session -> { windowStart, count, dropped, last }
++const NEW_SESSIONS_PER_MINUTE = 20;
++const SESSIONS_KEPT = 500;
++let newSessionTimes = [];
++let lastRefusalLogged = 0;
++
++// local patch 0007: brotli for the browser. A browser has no brotli compressor a script can call (and the plugins
++// that want one call it synchronously), so the shim's zlib asks here and Node does it. The Claudian plugin needs it
++// at load: its language files are brotli-compressed, and without this it fails with
++// "brotliDecompressSync is not a function". The bytes travel as base64 in JSON, which a synchronous XMLHttpRequest
++// can carry, as the fs shim's requests do.
++const BROTLI_LIMIT = 32 * 1024 * 1024; // the most either side may be, compressed or not
++
++app.post("/api/brotli", express.json({ limit: BROTLI_LIMIT }), (req, res) => {
++  const { mode, data } = req.body || {};
++
++  if ((mode !== "compress" && mode !== "decompress") || typeof data !== "string") {
++    return res
++      .status(400)
++      .json({ error: 'expected { mode: "compress" | "decompress", data: "<base64>" }' });
++  }
+ 
+-    origEnd.apply(this, args);
+-  };
++  const input = Buffer.from(data, "base64");
+ 
+-  next();
++  if (input.length > BROTLI_LIMIT) {
++    return res.status(413).json({ error: `more than ${BROTLI_LIMIT} bytes` });
++  }
++
++  try {
++    const zlib = require("zlib");
++    const output =
++      mode === "compress"
++        ? zlib.brotliCompressSync(input)
++        : zlib.brotliDecompressSync(input, { maxOutputLength: BROTLI_LIMIT });
++
++    return res.json({ data: output.toString("base64") });
++  } catch (e) {
++    return res.status(422).json({ error: `brotli could not ${mode} that: ${e.message}` });
++  }
++});
++
++app.post("/api/client-log", (req, res) => {
++  const { session, device, events } = req.body || {};
++
++  if (typeof session !== "string" || !/^[a-z0-9]{1,12}$/.test(session) || !Array.isArray(events)) {
++    return res.status(400).json({ error: "expected { session, device, events: [] }" });
++  }
++
++  const now = Date.now();
++  let s = clientSessions.get(session);
++
++  if (!s) {
++    // At most NEW_SESSIONS_PER_MINUTE new sessions a minute, and SESSIONS_KEPT in all: a client cannot flood the log
++    // by making up new session ids (each one's own budget is below)
++    newSessionTimes = newSessionTimes.filter((t) => now - t < 60000);
++
++    for (const [id, old] of clientSessions) {
++      if (now - old.last > 3600 * 1000) {
++        clientSessions.delete(id); // quiet for an hour: forgotten
++      }
++    }
++
++    if (newSessionTimes.length >= NEW_SESSIONS_PER_MINUTE || clientSessions.size >= SESSIONS_KEPT) {
++      if (now - lastRefusalLogged > 60000) {
++        lastRefusalLogged = now;
++        console.log("client-log: too many new sessions; reports from new pages refused for now");
++      }
++
++      return res.status(429).end();
++    }
++
++    newSessionTimes.push(now);
++    s = { windowStart: now, count: 0, dropped: 0, last: now };
++    clientSessions.set(session, s);
++    console.log(`client ${session}: new page on ${oneLine(device || "an unknown device", 160)}`);
++  }
++
++  s.last = now;
++
++  if (now - s.windowStart > CLIENT_WINDOW_MS) {
++    if (s.dropped) {
++      console.log(`client ${session}: ${s.dropped} more events in the last ${CLIENT_WINDOW_MS / 60000} minutes were not logged`);
++    }
++
++    s.windowStart = now;
++    s.count = 0;
++    s.dropped = 0;
++  }
++
++  for (const e of events.slice(0, 100)) {
++    if (s.count >= CLIENT_BUDGET) {
++      s.dropped += 1;
++      continue;
++    }
++
++    s.count += 1;
++    const level = ["error", "warn", "info"].includes(e?.level) ? e.level.toUpperCase() : "INFO";
++    const plugin = typeof e?.plugin === "string" && e.plugin ? ` [plugin ${oneLine(e.plugin, 60)}]` : "";
++    const stack = typeof e?.stack === "string" && e.stack ? ` -- stack: ${oneLine(e.stack, 400)}` : "";
++    const t = Number.isFinite(e?.t) ? ` +${e.t}s` : "";
++
++    console.log(`client ${session}${t} ${level} ${oneLine(e?.kind || "event", 30)}${plugin}: ${oneLine(e?.msg || "", 600)}${stack}`);
++  }
++
++  res.status(204).end();
+ });
+ 
+ const fsRoutes = require("./routes/fs");
+@@ -180,8 +343,10 @@ app.use(express.static(path.join(REPO_ROOT, "packages", "shim", "dist")));
+ 
+ app.use(express.static(config.obsidianAssetsPath));
+ 
+-const server = app.listen(config.port, async () => {
+-  console.log(`[ignis] Server running on http://localhost:${config.port}`);
++// Local patch (ZoteroSearch, 2026-10-23; ignis/patches/0002-listen-host.patch): HOST picks the address to listen on,
++// e.g. 127.0.0.1 so only this machine can connect. Unset, Ignis listens on every interface, as upstream does.
++const server = app.listen(config.port, process.env.HOST || undefined, async () => {
++  console.log(`[ignis] Server running on http://${process.env.HOST || "localhost"}:${config.port}`);
+   console.log(`[ignis] Vault root: ${config.vaultRoot}`);
+   console.log(`[ignis] Vaults: ${Object.keys(config.vaults).join(", ")}`);
+ 
+diff --git a/packages/shim/src/fs/sync.js b/packages/shim/src/fs/sync.js
+index bb9a73d..68581ee 100644
+--- a/packages/shim/src/fs/sync.js
++++ b/packages/shim/src/fs/sync.js
+@@ -20,10 +20,25 @@ export function createFsSync(metadataCache, contentCache, transport) {
+       }
+ 
+       const resolved = resolvePath(path);
+-      return metadataCache.has(resolved);
++      // local patch 0007: a virtual file is readable, so it is also there and can be stat'ed, as the input cache is.
++      return metadataCache.has(resolved) || hasVirtualFile(resolved);
+     },
+ 
+     statSync(path) {
++      const virtual = getVirtualFile(resolvePath(path));
++
++      if (virtual !== undefined) {
++        return {
++          size: typeof virtual === "string" ? virtual.length : virtual.byteLength || 0,
++          mode: 0o100755, // a file anything may read and run: what a program on disk looks like
++          mtime: new Date(0),
++          ctime: new Date(0),
++          isFile: () => true,
++          isDirectory: () => false,
++          isSymbolicLink: () => false,
++        };
++      }
++
+       if (isInputCachePath(path) && inputCacheGet(path) !== null) {
+         const data = inputCacheGet(path);
+         const size = data ? data.length || data.byteLength || 0 : 0;
+@@ -57,6 +72,10 @@ export function createFsSync(metadataCache, contentCache, transport) {
+         return;
+       }
+ 
++      if (hasVirtualFile(resolvePath(path))) {
++        return; // local patch 0007: as above, a virtual file is there to be read
++      }
++
+       const resolved = resolvePath(path);
+ 
+       if (!metadataCache.has(resolved)) {
+diff --git a/packages/shim/src/node/async_hooks.js b/packages/shim/src/node/async_hooks.js
+new file mode 100644
+index 0000000..5caed19
+--- /dev/null
++++ b/packages/shim/src/node/async_hooks.js
+@@ -0,0 +1,87 @@
++// local patch 0007: Node's async_hooks, as much as a plugin that carries context alongside its work needs. A browser
++// tab runs one thing at a time, so the store is simply the current one, put back when the call that set it returns.
++// Context does not follow an `await` as it does in Node; what uses this here is error reporting, which reads the
++// store in the same turn it was set.
++
++export class AsyncLocalStorage {
++  constructor() {
++    this.store = undefined;
++  }
++
++  run(store, callback, ...args) {
++    const before = this.store;
++    this.store = store;
++
++    try {
++      return callback(...args);
++    } finally {
++      this.store = before;
++    }
++  }
++
++  enterWith(store) {
++    this.store = store;
++  }
++
++  exit(callback, ...args) {
++    return this.run(undefined, callback, ...args);
++  }
++
++  getStore() {
++    return this.store;
++  }
++
++  disable() {
++    this.store = undefined;
++  }
++}
++
++export class AsyncResource {
++  constructor(type) {
++    this.type = type;
++  }
++
++  runInAsyncScope(callback, thisArg, ...args) {
++    return callback.apply(thisArg, args);
++  }
++
++  emitDestroy() {
++    return this;
++  }
++
++  asyncId() {
++    return 0;
++  }
++
++  triggerAsyncId() {
++    return 0;
++  }
++
++  bind(fn) {
++    return fn;
++  }
++
++  static bind(fn) {
++    return fn;
++  }
++}
++
++export function executionAsyncId() {
++  return 0;
++}
++
++export function triggerAsyncId() {
++  return 0;
++}
++
++export function createHook() {
++  return { enable() {}, disable() {} };
++}
++
++export default {
++  AsyncLocalStorage,
++  AsyncResource,
++  executionAsyncId,
++  triggerAsyncId,
++  createHook,
++};
+diff --git a/packages/shim/src/node/child_process.js b/packages/shim/src/node/child_process.js
+index 960617a..4402d75 100644
+--- a/packages/shim/src/node/child_process.js
++++ b/packages/shim/src/node/child_process.js
+@@ -1,3 +1,452 @@
++// local patch 0007: Claude Code in the browser, started by Ignis's launcher.
++//
++// A browser cannot start a process, so every function here threw. The launcher can, and does it inside a Windows
++// AppContainer of its own that may change the vault and nothing else (ignis/SETUP.md, "Claude Code"); it carries the
++// CLI's standard input and output over the same-origin relay, `<this page>/relay/claude/...`. spawn() below is that
++// route, shaped like Node's ChildProcess, so that the Claudian plugin and the Claude Agent SDK inside it work
++// unchanged: they still believe they started a child process.
++//
++// What may be started: the Claude Code CLI, and nothing else. The command the caller names is never passed on -- the
++// launcher knows where the real claude.exe is and chooses it itself -- and a command that is not the CLI is refused
++// here with the same ENOENT a missing program gives, so a plugin that tries to run anything else fails as before.
++// Everything the CLI then does is held inside its AppContainer: it can read and write the vault, and nothing else of
++// the computer.
++
++import { EventEmitter } from "./events.js";
++import { setVirtualFile } from "../fs/virtual-files.js";
++
++// The CLI's path as the browser sees it. Nothing is ever read from it: it exists as a file only so that a plugin's
++// own "is the CLI installed?" check passes, and its name is what marks a spawn as the Claude Code CLI's. It sits
++// under a folder of Ignis's own, not at the root, so that it cannot stand in front of a note: a bare "/claude" would
++// answer for a vault item of that name (Windows would match a "CLAUDE" folder as well) and shadow it.
++export const CLAUDE_CLI_PATH = "/.ignis/claude";
++
++setVirtualFile(
++  CLAUDE_CLI_PATH,
++  "Claude Code runs on the computer that serves this page, outside the browser (Ignis patch 0007).\n",
++);
++
++const service = () => new URL("/relay/claude/", location.origin).toString();
++
++function basename(command) {
++  return String(command || "")
++    .replace(/\\/g, "/")
++    .split("/")
++    .pop()
++    .toLowerCase();
++}
++
++function isClaudeCli(command) {
++  const name = basename(command);
++  return name === "claude" || name === "claude.exe";
++}
++
++function toBytes(chunk, encoding) {
++  if (typeof chunk === "string") {
++    return new TextEncoder().encode(chunk);
++  }
++
++  if (chunk instanceof Uint8Array) {
++    return chunk;
++  }
++
++  if (chunk && typeof chunk.byteLength === "number") {
++    return new Uint8Array(chunk);
++  }
++
++  return new TextEncoder().encode(String(chunk ?? ""));
++}
++
++function asChunk(bytes) {
++  // Plugins expect what Node gives them: a Buffer when Obsidian's one is about, else the bytes themselves.
++  return typeof globalThis.Buffer?.from === "function"
++    ? globalThis.Buffer.from(bytes)
++    : bytes;
++}
++
++// A readable stream with just what a child's output is used for: data and end events, an async iterator, pausing,
++// and an encoding.
++class RelayReadable extends EventEmitter {
++  constructor() {
++    super();
++    this.readable = true;
++    this.destroyed = false;
++    this.encoding = null;
++    this.paused = false;
++    this.waiting = [];
++    this.ended = false;
++  }
++
++  setEncoding(encoding) {
++    this.encoding = encoding;
++    return this;
++  }
++
++  pause() {
++    this.paused = true;
++    return this;
++  }
++
++  resume() {
++    this.paused = false;
++    const held = this.waiting;
++    this.waiting = [];
++    held.forEach((bytes) => this.deliver(bytes));
++
++    if (this.ended) {
++      this.finish();
++    }
++
++    return this;
++  }
++
++  deliver(bytes) {
++    if (this.destroyed || !bytes.length) {
++      return;
++    }
++
++    if (this.paused) {
++      this.waiting.push(bytes);
++      return;
++    }
++
++    const encoding = this.encoding;
++    this.emit(
++      "data",
++      encoding && encoding !== "buffer"
++        ? new TextDecoder(encoding === "utf8" ? "utf-8" : encoding).decode(bytes)
++        : asChunk(bytes),
++    );
++  }
++
++  finish() {
++    this.ended = true;
++
++    if (this.paused || this.destroyed) {
++      return;
++    }
++
++    this.readable = false;
++    this.emit("end");
++    this.emit("close");
++  }
++
++  read() {
++    return null;
++  }
++
++  destroy() {
++    this.destroyed = true;
++    this.readable = false;
++    this.emit("close");
++  }
++
++  pipe(destination) {
++    this.on("data", (chunk) => destination.write?.(chunk));
++    this.on("end", () => destination.end?.());
++    return destination;
++  }
++
++  async *[Symbol.asyncIterator]() {
++    const queue = [];
++    let wake = null;
++    let done = false;
++
++    this.on("data", (chunk) => {
++      queue.push(chunk);
++      wake?.();
++    });
++    this.on("end", () => {
++      done = true;
++      wake?.();
++    });
++
++    for (;;) {
++      if (queue.length) {
++        yield queue.shift();
++        continue;
++      }
++
++      if (done) {
++        return;
++      }
++
++      await new Promise((resolve) => {
++        wake = () => {
++          wake = null;
++          resolve();
++        };
++      });
++    }
++  }
++}
++
++// A writable stream whose writes are posted to the launcher. Writes made before the CLI has started are kept and
++// sent in order once it has.
++class RelayWritable extends EventEmitter {
++  constructor(session) {
++    super();
++    this.session = session;
++    this.writable = true;
++    this.destroyed = false;
++  }
++
++  write(chunk, encoding, callback) {
++    if (typeof encoding === "function") {
++      callback = encoding;
++      encoding = undefined;
++    }
++
++    if (!this.writable) {
++      const error = new Error("EPIPE: the CLI is no longer reading its input");
++      error.code = "EPIPE";
++      callback?.(error);
++      this.emit("error", error);
++      return false;
++    }
++
++    this.session.send(toBytes(chunk, encoding), callback);
++    return true;
++  }
++
++  end(chunk, encoding, callback) {
++    if (typeof chunk === "function") {
++      callback = chunk;
++      chunk = undefined;
++    }
++
++    if (chunk !== undefined && chunk !== null) {
++      this.write(chunk, encoding);
++    }
++
++    this.writable = false;
++    this.session.closeInput();
++    callback?.();
++    this.emit("finish");
++    return this;
++  }
++
++  destroy() {
++    this.destroyed = true;
++    this.writable = false;
++  }
++}
++
++class RelayChildProcess extends EventEmitter {
++  constructor(args, options) {
++    super();
++    this.spawnargs = args;
++    this.pid = undefined;
++    this.exitCode = null;
++    this.signalCode = null;
++    this.killed = false;
++    this.id = null;
++    this.stdout = new RelayReadable();
++    this.stderr = new RelayReadable(); // the launcher sends the CLI's error output with its output, as Node's "ignore"
++    this.stdin = new RelayWritable(this);
++    this.stdio = [this.stdin, this.stdout, this.stderr];
++    this.held = [];
++    this.inputClosed = false;
++    this.finished = false;
++    this.start(args, options);
++  }
++
++  async start(args) {
++    try {
++      const answer = await fetch(`${service()}start`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ args }),
++      });
++      const body = await answer.json().catch(() => ({}));
++
++      if (!answer.ok) {
++        throw new Error(
++          body.error || `the launcher refused to start Claude Code (${answer.status})`,
++        );
++      }
++
++      this.id = body.id;
++      this.pid = body.pid;
++      this.emit("spawn");
++      const held = this.held;
++      this.held = [];
++
++      for (const { bytes, callback } of held) {
++        await this.post(bytes, callback);
++      }
++
++      if (this.inputClosed) {
++        await this.stop("input");
++      }
++
++      this.follow();
++    } catch (error) {
++      this.fail(error);
++    }
++  }
++
++  fail(error) {
++    if (this.finished) {
++      return;
++    }
++
++    this.finished = true;
++    const failure = error instanceof Error ? error : new Error(String(error));
++    this.emit("error", failure);
++    this.stdout.finish();
++    this.end(1, null);
++  }
++
++  end(code, signal) {
++    this.exitCode = code;
++    this.signalCode = signal;
++    this.stdin.writable = false;
++    this.emit("exit", code, signal);
++    this.emit("close", code, signal);
++  }
++
++  send(bytes, callback) {
++    if (this.id === null) {
++      this.held.push({ bytes, callback });
++      return;
++    }
++
++    this.post(bytes, callback);
++  }
++
++  async post(bytes, callback) {
++    try {
++      const answer = await fetch(`${service()}input/${this.id}`, {
++        method: "POST",
++        headers: { "Content-Type": "application/octet-stream" },
++        body: bytes,
++      });
++
++      if (!answer.ok) {
++        const body = await answer.json().catch(() => ({}));
++        throw new Error(body.error || `the CLI did not take the input (${answer.status})`);
++      }
++
++      callback?.();
++    } catch (error) {
++      callback?.(error);
++      this.stdin.emit("error", error);
++    }
++  }
++
++  closeInput() {
++    this.inputClosed = true;
++
++    if (this.id !== null) {
++      this.stop("input");
++    }
++  }
++
++  // The CLI's output, as server-sent events: each `data:` frame is base64 of what it wrote, and an `exit` event
++  // carries its exit code.
++  async follow() {
++    try {
++      const answer = await fetch(`${service()}output/${this.id}`, {
++        headers: { Accept: "text/event-stream" },
++      });
++
++      if (!answer.ok || !answer.body) {
++        throw new Error(`the CLI's output could not be read (${answer.status})`);
++      }
++
++      const reader = answer.body.getReader();
++      const decoder = new TextDecoder();
++      let text = "";
++
++      for (;;) {
++        const { value, done } = await reader.read();
++
++        if (done) {
++          break;
++        }
++
++        text += decoder.decode(value, { stream: true });
++        const frames = text.split("\n\n");
++        text = frames.pop();
++
++        for (const frame of frames) {
++          this.frame(frame);
++        }
++      }
++
++      if (!this.finished) {
++        // The stream ended without an exit event: the launcher or the pipe went away.
++        this.finished = true;
++        this.stdout.finish();
++        this.end(null, "SIGHUP");
++      }
++    } catch (error) {
++      this.fail(error);
++    }
++  }
++
++  frame(frame) {
++    const lines = frame.split("\n");
++    const event = lines.find((line) => line.startsWith("event: "))?.slice(7);
++    const data = lines
++      .filter((line) => line.startsWith("data: "))
++      .map((line) => line.slice(6))
++      .join("");
++
++    if (event === "exit") {
++      this.finished = true;
++      this.stdout.finish();
++      this.stderr.finish();
++      this.end(Number(data), null);
++      return;
++    }
++
++    if (!data) {
++      return; // a comment frame, which only keeps the connection alive
++    }
++
++    const binary = atob(data);
++    const bytes = new Uint8Array(binary.length);
++
++    for (let i = 0; i < binary.length; i += 1) {
++      bytes[i] = binary.charCodeAt(i);
++    }
++
++    this.stdout.deliver(bytes);
++  }
++
++  async stop(what) {
++    try {
++      await fetch(`${service()}stop/${this.id}`, { method: "POST" });
++    } catch {
++      // the session is gone already, which is what was asked for
++      void what;
++    }
++  }
++
++  kill(signal) {
++    this.killed = true;
++
++    if (this.id !== null) {
++      this.stop(signal || "SIGTERM");
++    } else {
++      this.held = [];
++      this.fail(new Error("the session was stopped before it started"));
++    }
++
++    return true;
++  }
++
++  ref() {
++    return this;
++  }
++
++  unref() {
++    return this;
++  }
++}
++
+ function notAvailable(name) {
+   return function () {
+     throw new Error(
+@@ -6,9 +455,39 @@ function notAvailable(name) {
+   };
+ }
+ 
++export function spawn(command, args, options) {
++  if (!Array.isArray(args)) {
++    options = args;
++    args = [];
++  }
++
++  if (!isClaudeCli(command)) {
++    // The same failure Node gives for a program that is not there, so a plugin that tries to run something else
++    // reports what it reported before this patch.
++    const child = new EventEmitter();
++    child.pid = undefined;
++    child.stdin = null;
++    child.stdout = null;
++    child.stderr = null;
++    child.kill = () => false;
++    setTimeout(() => {
++      const error = new Error(`spawn ${command} ENOENT`);
++      error.code = "ENOENT";
++      error.errno = -4058;
++      error.syscall = `spawn ${command}`;
++      error.path = command;
++      child.emit("error", error);
++      child.emit("close", null, null);
++    }, 0);
++    return child;
++  }
++
++  void options; // cwd, env and stdio are the launcher's to choose: it runs the CLI on the vault, in its sandbox
++  return new RelayChildProcess(args || []);
++}
++
+ export const exec = notAvailable("exec");
+ export const execSync = notAvailable("execSync");
+-export const spawn = notAvailable("spawn");
+ export const fork = notAvailable("fork");
+ export const execFile = notAvailable("execFile");
+ export const execFileSync = notAvailable("execFileSync");
+diff --git a/packages/shim/src/node/child_process.test.js b/packages/shim/src/node/child_process.test.js
+new file mode 100644
+index 0000000..32afc81
+--- /dev/null
++++ b/packages/shim/src/node/child_process.test.js
+@@ -0,0 +1,180 @@
++// local patch 0007: the spawn that runs Claude Code through the launcher's relay.
++import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
++
++import { spawn, CLAUDE_CLI_PATH } from "./child_process.js";
++import { createFsSync } from "../fs/sync.js";
++import { createInterface } from "./readline.js";
++import { StringDecoder } from "./string_decoder.js";
++import { AsyncLocalStorage } from "./async_hooks.js";
++
++function stream(frames) {
++  return new ReadableStream({
++    start(controller) {
++      frames.forEach((frame) => controller.enqueue(new TextEncoder().encode(frame)));
++      controller.close();
++    },
++  });
++}
++
++function frame(text) {
++  return `data: ${btoa(text)}\n\n`;
++}
++
++const asked = [];
++
++function serve({ start = { id: "abc", pid: 42 }, output = [], status = 200 } = {}) {
++  return vi.fn(async (url, options) => {
++    asked.push({
++      url: String(url),
++      method: options?.method || "GET",
++      body: options?.body,
++    });
++
++    if (String(url).endsWith("/start")) {
++      return {
++        ok: status === 200,
++        status,
++        json: async () => start,
++      };
++    }
++
++    if (String(url).includes("/output/")) {
++      return { ok: true, status: 200, body: stream(output) };
++    }
++
++    return { ok: true, status: 200, json: async () => ({ written: 1 }) };
++  });
++}
++
++async function settle(times = 12) {
++  for (let i = 0; i < times; i += 1) {
++    await Promise.resolve();
++    await new Promise((resolve) => setTimeout(resolve, 0));
++  }
++}
++
++describe("spawn through the launcher's relay", () => {
++  beforeEach(() => {
++    asked.length = 0;
++    vi.stubGlobal("location", { origin: "https://vault.example" });
++  });
++
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  it("refuses any program but the Claude Code CLI, as a missing one does", async () => {
++    vi.stubGlobal("fetch", serve());
++    const child = spawn("/usr/bin/git", ["status"]);
++    const error = await new Promise((resolve) => child.on("error", resolve));
++
++    expect(error.code).toBe("ENOENT");
++    expect(error.message).toContain("git");
++    expect(asked).toEqual([]); // nothing was asked of the launcher
++  });
++
++  it("starts the CLI, and never passes the command on", async () => {
++    vi.stubGlobal("fetch", serve({ output: [frame("hello\n"), "event: exit\ndata: 0\n\n"] }));
++    const child = spawn(CLAUDE_CLI_PATH, ["--version"], { cwd: "/anywhere" });
++    await settle();
++
++    const start = asked.find((a) => a.url.endsWith("/start"));
++    expect(start.url).toBe("https://vault.example/relay/claude/start");
++    expect(JSON.parse(start.body)).toEqual({ args: ["--version"] });
++    expect(child.pid).toBe(42);
++  });
++
++  it("gives the CLI's output as a stream and its exit code as a close event", async () => {
++    vi.stubGlobal("fetch", serve({ output: [frame('{"a":1}\n'), ": waiting\n\n", frame("more\n"), "event: exit\ndata: 0\n\n"] }));
++    const child = spawn(CLAUDE_CLI_PATH, []);
++    const read = [];
++    child.stdout.on("data", (chunk) => read.push(chunk.toString()));
++    const code = await new Promise((resolve) => child.on("close", resolve));
++
++    expect(read.join("")).toBe('{"a":1}\nmore\n');
++    expect(code).toBe(0);
++  });
++
++  it("holds what is written before the CLI has started, then sends it in order", async () => {
++    vi.stubGlobal("fetch", serve({ output: ["event: exit\ndata: 0\n\n"] }));
++    const child = spawn(CLAUDE_CLI_PATH, []);
++    child.stdin.write('{"one":1}\n');
++    child.stdin.write('{"two":2}\n');
++    await settle();
++
++    const writes = asked.filter((a) => a.url.includes("/input/"));
++    expect(writes.map((w) => new TextDecoder().decode(w.body))).toEqual([
++      '{"one":1}\n',
++      '{"two":2}\n',
++    ]);
++    expect(writes[0].url).toBe("https://vault.example/relay/claude/input/abc");
++  });
++
++  it("reports a refusal by the launcher as an error, not a silent hang", async () => {
++    vi.stubGlobal("fetch", serve({ status: 503, start: { error: "no sign-in yet" } }));
++    const child = spawn(CLAUDE_CLI_PATH, []);
++    const error = await new Promise((resolve) => child.on("error", resolve));
++
++    expect(error.message).toContain("no sign-in yet");
++  });
++
++  it("asks the launcher to stop the session when it is killed", async () => {
++    vi.stubGlobal("fetch", serve({ output: [": waiting\n\n"] }));
++    const child = spawn(CLAUDE_CLI_PATH, []);
++    await settle();
++    child.kill("SIGTERM");
++    await settle(4);
++
++    expect(asked.some((a) => a.url === "https://vault.example/relay/claude/stop/abc")).toBe(true);
++  });
++
++  it("ends with a close event when the stream drops without an exit", async () => {
++    vi.stubGlobal("fetch", serve({ output: [frame("partial")] }));
++    const child = spawn(CLAUDE_CLI_PATH, []);
++    const signal = await new Promise((resolve) => child.on("close", (code, s) => resolve(s)));
++
++    expect(signal).toBe("SIGHUP");
++  });
++
++  it("iterates the CLI's output line by line, as the agent SDK reads it", async () => {
++    vi.stubGlobal("fetch", serve({ output: [frame('{"a":1}\n{"b":'), frame('2}\n'), "event: exit\ndata: 0\n\n"] }));
++    const child = spawn(CLAUDE_CLI_PATH, []);
++    const lines = [];
++
++    for await (const line of createInterface({ input: child.stdout })) {
++      lines.push(line);
++    }
++
++    expect(lines).toEqual(['{"a":1}', '{"b":2}']);
++  });
++});
++
++describe("the modules a plugin running Claude Code also needs", () => {
++  it("decodes a character split across two chunks", () => {
++    const decoder = new StringDecoder("utf8");
++    const bytes = new TextEncoder().encode("é");
++
++    expect(decoder.write(bytes.slice(0, 1))).toBe("");
++    expect(decoder.write(bytes.slice(1))).toBe("é");
++  });
++
++  it("keeps a store for the length of a call", () => {
++    const storage = new AsyncLocalStorage();
++
++    expect(storage.getStore()).toBeUndefined();
++    expect(storage.run({ id: 1 }, () => storage.getStore().id)).toBe(1);
++    expect(storage.getStore()).toBeUndefined();
++  });
++});
++
++describe("the CLI's path in the browser", () => {
++  it("is there to be stat'ed, so a plugin's check for the CLI passes", () => {
++    const metadata = { has: () => false, toStat: () => null, get: () => null };
++    const fs = createFsSync(metadata, { get: () => null }, {});
++
++    expect(fs.existsSync(CLAUDE_CLI_PATH)).toBe(true);
++    expect(fs.statSync(CLAUDE_CLI_PATH).isFile()).toBe(true);
++    expect(() => fs.accessSync(CLAUDE_CLI_PATH, 1)).not.toThrow();
++    expect(fs.existsSync("/not-the-cli")).toBe(false);
++  });
++});
+diff --git a/packages/shim/src/node/module.js b/packages/shim/src/node/module.js
+new file mode 100644
+index 0000000..70ec0e5
+--- /dev/null
++++ b/packages/shim/src/node/module.js
+@@ -0,0 +1,22 @@
++// local patch 0007: Node's module, only what a bundle built for Node asks of it on the way in. createRequire gives
++// back the shim's own require, so a plugin that makes its own require ends up with the shimmed modules.
++
++export function createRequire() {
++  return window.require;
++}
++
++export const builtinModules = [];
++
++export function isBuiltin(name) {
++  return typeof name === "string" && name.startsWith("node:");
++}
++
++const Module = {
++  createRequire,
++  builtinModules,
++  isBuiltin,
++  _cache: {},
++};
++
++export { Module };
++export default Module;
+diff --git a/packages/shim/src/node/readline.js b/packages/shim/src/node/readline.js
+new file mode 100644
+index 0000000..da6bef6
+--- /dev/null
++++ b/packages/shim/src/node/readline.js
+@@ -0,0 +1,110 @@
++// local patch 0007: Node's readline, enough of it to read a stream line by line. The Claude Agent SDK reads the
++// CLI's output this way (one JSON message per line), both with the "line" event and by iterating the interface.
++
++import { EventEmitter } from "./events.js";
++
++class Interface extends EventEmitter {
++  constructor(options) {
++    super();
++    const input = options?.input ?? options;
++    this.input = input;
++    this.output = options?.output ?? null;
++    this.closed = false;
++    this.rest = "";
++    this.lines = [];
++    this.wake = null;
++
++    if (input && typeof input.on === "function") {
++      input.on("data", (chunk) => this.take(chunk));
++      input.on("end", () => this.close());
++      input.on("close", () => this.close());
++      input.on("error", (error) => this.emit("error", error));
++    }
++  }
++
++  take(chunk) {
++    const text =
++      typeof chunk === "string"
++        ? chunk
++        : new TextDecoder().decode(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
++    this.rest += text;
++    const parts = this.rest.split("\n");
++    this.rest = parts.pop();
++
++    for (const part of parts) {
++      const line = part.endsWith("\r") ? part.slice(0, -1) : part;
++      this.lines.push(line);
++      this.emit("line", line);
++    }
++
++    this.wake?.();
++  }
++
++  close() {
++    if (this.closed) {
++      return;
++    }
++
++    this.closed = true;
++
++    if (this.rest.length) {
++      const line = this.rest;
++      this.rest = "";
++      this.lines.push(line);
++      this.emit("line", line);
++    }
++
++    this.emit("close");
++    this.wake?.();
++  }
++
++  pause() {
++    this.input?.pause?.();
++    return this;
++  }
++
++  resume() {
++    this.input?.resume?.();
++    return this;
++  }
++
++  write() {}
++
++  question(query, callback) {
++    // Nothing can be typed into a stream the browser does not own; a plugin that asks gets an empty answer rather
++    // than a wait that never ends.
++    void query;
++    callback?.("");
++  }
++
++  async *[Symbol.asyncIterator]() {
++    for (;;) {
++      if (this.lines.length) {
++        yield this.lines.shift();
++        continue;
++      }
++
++      if (this.closed) {
++        return;
++      }
++
++      await new Promise((resolve) => {
++        this.wake = () => {
++          this.wake = null;
++          resolve();
++        };
++      });
++    }
++  }
++}
++
++export function createInterface(options) {
++  return new Interface(options);
++}
++
++export const promises = {
++  createInterface: (options) => new Interface(options),
++};
++
++export { Interface };
++export default { createInterface, Interface, promises };
+diff --git a/packages/shim/src/node/string_decoder.js b/packages/shim/src/node/string_decoder.js
+new file mode 100644
+index 0000000..166401a
+--- /dev/null
++++ b/packages/shim/src/node/string_decoder.js
+@@ -0,0 +1,28 @@
++// local patch 0007: Node's string_decoder, which plugins use to turn a child process's output into text without
++// cutting a character in half across two chunks. TextDecoder does the same work when told to stream.
++
++export class StringDecoder {
++  constructor(encoding = "utf8") {
++    this.encoding = encoding === "utf8" ? "utf-8" : encoding;
++    this.decoder = new TextDecoder(this.encoding);
++  }
++
++  write(chunk) {
++    if (chunk === undefined || chunk === null) {
++      return "";
++    }
++
++    if (typeof chunk === "string") {
++      return chunk;
++    }
++
++    return this.decoder.decode(chunk, { stream: true });
++  }
++
++  end(chunk) {
++    const last = chunk ? this.write(chunk) : "";
++    return last + this.decoder.decode();
++  }
++}
++
++export default { StringDecoder };
+diff --git a/packages/shim/src/node/zlib.js b/packages/shim/src/node/zlib.js
+index b310afa..acca7d4 100644
+--- a/packages/shim/src/node/zlib.js
++++ b/packages/shim/src/node/zlib.js
+@@ -58,6 +58,13 @@ function toUint8Array(buf) {
+   return new Uint8Array(buf);
+ }
+ 
++// What Node's zlib gives back is a Buffer, and callers treat it as one: `.toString("utf8")` on a plain Uint8Array
++// returns "108,111,..." instead of text. pako answers with a Uint8Array, so every result is wrapped here. A Buffer
++// is a Uint8Array, so anything already treating these as bytes is unaffected.
++function asBuffer(bytes) {
++  return typeof globalThis.Buffer?.from === "function" ? globalThis.Buffer.from(bytes) : bytes;
++}
++
+ function wrapAsync(syncFn) {
+   return function (buf, optionsOrCb, cb) {
+     if (typeof optionsOrCb === "function") {
+@@ -82,31 +89,82 @@ function wrapAsync(syncFn) {
+ // --- Sync functions ---
+ 
+ export function deflateSync(buf, options) {
+-  return pako.deflate(toUint8Array(buf), options);
++  return asBuffer(pako.deflate(toUint8Array(buf), options));
+ }
+ 
+ export function inflateSync(buf, options) {
+-  return pako.inflate(toUint8Array(buf), options);
++  return asBuffer(pako.inflate(toUint8Array(buf), options));
+ }
+ 
+ export function deflateRawSync(buf, options) {
+-  return pako.deflateRaw(toUint8Array(buf), options);
++  return asBuffer(pako.deflateRaw(toUint8Array(buf), options));
+ }
+ 
+ export function inflateRawSync(buf, options) {
+-  return pako.inflateRaw(toUint8Array(buf), options);
++  return asBuffer(pako.inflateRaw(toUint8Array(buf), options));
+ }
+ 
+ export function gzipSync(buf, options) {
+-  return pako.gzip(toUint8Array(buf), options);
++  return asBuffer(pako.gzip(toUint8Array(buf), options));
+ }
+ 
+ export function gunzipSync(buf, options) {
+-  return pako.ungzip(toUint8Array(buf), options);
++  return asBuffer(pako.ungzip(toUint8Array(buf), options));
+ }
+ 
+ export function unzipSync(buf, options) {
+-  return pako.ungzip(toUint8Array(buf), options);
++  return asBuffer(pako.ungzip(toUint8Array(buf), options));
++}
++
++// --- Brotli (local patch 0007) ---
++//
++// pako does deflate and gzip, not brotli, and a browser exposes no brotli a script may call: DecompressionStream
++// handles gzip and deflate only, and is asynchronous besides, while Node's brotli functions here are synchronous.
++// So the server does it, over the same kind of synchronous request the fs shim makes, with the bytes as base64.
++// The Claudian plugin needs this at load: its language files are brotli-compressed.
++
++function brotli(mode, buf) {
++  const bytes = toUint8Array(buf);
++  let binary = "";
++
++  for (let i = 0; i < bytes.length; i += 0x8000) {
++    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
++  }
++
++  const xhr = new XMLHttpRequest();
++  xhr.open("POST", new URL("/api/brotli", location.origin).toString(), false); // synchronous
++  xhr.setRequestHeader("Content-Type", "application/json");
++  xhr.send(JSON.stringify({ mode, data: btoa(binary) }));
++
++  if (xhr.status >= 400) {
++    let why = `the server answered ${xhr.status}`;
++
++    try {
++      why = JSON.parse(xhr.responseText).error || why;
++    } catch {
++      // the answer was not JSON; the status is all we can say
++    }
++
++    throw new Error(`zlib.brotli${mode === "compress" ? "Compress" : "Decompress"}Sync: ${why}`);
++  }
++
++  const answer = atob(JSON.parse(xhr.responseText).data);
++  const out = new Uint8Array(answer.length);
++
++  for (let i = 0; i < answer.length; i += 1) {
++    out[i] = answer.charCodeAt(i);
++  }
++
++  // A Buffer when Obsidian's one is about: callers expect Node's, and call .toString("utf8") on the result.
++  return typeof globalThis.Buffer?.from === "function" ? globalThis.Buffer.from(out) : out;
++}
++
++export function brotliCompressSync(buf) {
++  return brotli("compress", buf);
++}
++
++export function brotliDecompressSync(buf) {
++  return brotli("decompress", buf);
+ }
+ 
+ // --- Async functions (callback style) ---
+@@ -118,6 +176,8 @@ export const inflateRaw = wrapAsync(inflateRawSync);
+ export const gzip = wrapAsync(gzipSync);
+ export const gunzip = wrapAsync(gunzipSync);
+ export const unzip = wrapAsync(unzipSync);
++export const brotliCompress = wrapAsync(brotliCompressSync);
++export const brotliDecompress = wrapAsync(brotliDecompressSync);
+ 
+ // --- Streaming stubs (not yet implemented) ---
+ 
+diff --git a/packages/shim/src/node/zlib.test.js b/packages/shim/src/node/zlib.test.js
+new file mode 100644
+index 0000000..7ba1882
+--- /dev/null
++++ b/packages/shim/src/node/zlib.test.js
+@@ -0,0 +1,150 @@
++// local patch 0007: brotli through the server, which the Claudian plugin needs to load (its language files are
++// brotli-compressed and it decompresses them synchronously).
++import zlib from "node:zlib";
++import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
++
++import {
++  brotliCompressSync,
++  brotliDecompressSync,
++  deflateRawSync,
++  deflateSync,
++  gunzipSync,
++  gzipSync,
++  inflateRawSync,
++  inflateSync,
++  unzipSync,
++} from "./zlib.js";
++
++// Stands in for the Ignis server's /api/brotli route, with the same contract: base64 in JSON both ways.
++function serverStub({ status = 200, error = null } = {}) {
++  const sent = [];
++
++  class FakeXhr {
++    open(method, url, isAsync) {
++      sent.push({ method, url, isAsync });
++      this.status = status;
++    }
++
++    setRequestHeader() {}
++
++    send(body) {
++      if (error) {
++        this.responseText = JSON.stringify({ error });
++        return;
++      }
++
++      const { mode, data } = JSON.parse(body);
++      const input = Buffer.from(data, "base64");
++      const output =
++        mode === "compress"
++          ? zlib.brotliCompressSync(input)
++          : zlib.brotliDecompressSync(input);
++      this.responseText = JSON.stringify({ data: output.toString("base64") });
++    }
++  }
++
++  vi.stubGlobal("XMLHttpRequest", FakeXhr);
++  vi.stubGlobal("location", { origin: "https://vault.example" });
++  return sent;
++}
++
++describe("zlib.brotli* through the server", () => {
++  beforeEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  it("decompresses what Node compressed, and gives back a Buffer", () => {
++    serverStub();
++    const text = JSON.stringify({ common: { ok: "yes" } });
++    const compressed = zlib.brotliCompressSync(Buffer.from(text));
++
++    const out = brotliDecompressSync(compressed);
++
++    expect(Buffer.isBuffer(out)).toBe(true); // callers do .toString("utf8") on it
++    expect(out.toString("utf8")).toBe(text);
++    expect(JSON.parse(out.toString("utf8")).common.ok).toBe("yes");
++  });
++
++  it("asks the server synchronously, on the page's own origin", () => {
++    const sent = serverStub();
++    brotliDecompressSync(zlib.brotliCompressSync(Buffer.from("x")));
++
++    expect(sent).toEqual([
++      { method: "POST", url: "https://vault.example/api/brotli", isAsync: false },
++    ]);
++  });
++
++  it("compresses, so that Node can read it back", () => {
++    serverStub();
++    const out = brotliCompressSync(Buffer.from("round trip"));
++
++    expect(zlib.brotliDecompressSync(out).toString("utf8")).toBe("round trip");
++  });
++
++  it("carries data larger than one String.fromCharCode call", () => {
++    serverStub();
++    const big = Buffer.alloc(200000, 7); // over the 0x8000 chunk the shim encodes in
++    const out = brotliDecompressSync(zlib.brotliCompressSync(big));
++
++    expect(out.length).toBe(big.length);
++    expect(out.equals(big)).toBe(true);
++  });
++
++  it("reports the server's own reason when it refuses", () => {
++    serverStub({ status: 422, error: "brotli could not decompress that: unexpected end of input" });
++
++    expect(() => brotliDecompressSync(Buffer.from("not brotli"))).toThrow(
++      /brotliDecompressSync: brotli could not decompress that/,
++    );
++  });
++
++  it("reports the status when the answer is not even JSON", () => {
++    serverStub({ status: 500 });
++    vi.stubGlobal(
++      "XMLHttpRequest",
++      class {
++        open() {
++          this.status = 500;
++        }
++        setRequestHeader() {}
++        send() {
++          this.responseText = "<html>no</html>";
++        }
++      },
++    );
++
++    expect(() => brotliDecompressSync(Buffer.from("x"))).toThrow(/answered 500/);
++  });
++
++  it("leaves gzip and deflate to pako, with no request at all", () => {
++    const sent = serverStub();
++    const out = gunzipSync(gzipSync(Buffer.from("local")));
++
++    expect(new TextDecoder().decode(out)).toBe("local");
++    expect(sent).toEqual([]);
++  });
++
++  it("gives a Buffer from the pako-backed functions too, as Node does", () => {
++    serverStub();
++
++    // pako answers with a Uint8Array, whose .toString() is "108,111,..." rather than text. Callers written for
++    // Node's zlib treat the result as a Buffer, so every one of these wraps it.
++    for (const [name, out] of [
++      ["gunzipSync", gunzipSync(gzipSync(Buffer.from("local")))],
++      ["gzipSync", gzipSync(Buffer.from("local"))],
++      ["inflateSync", inflateSync(deflateSync(Buffer.from("local")))],
++      ["deflateSync", deflateSync(Buffer.from("local"))],
++      ["inflateRawSync", inflateRawSync(deflateRawSync(Buffer.from("local")))],
++      ["unzipSync", unzipSync(gzipSync(Buffer.from("local")))],
++    ]) {
++      expect(Buffer.isBuffer(out), `${name} should give a Buffer`).toBe(true);
++    }
++
++    expect(gunzipSync(gzipSync(Buffer.from("local"))).toString("utf8")).toBe("local");
++    expect(inflateSync(deflateSync(Buffer.from("local"))).toString("utf8")).toBe("local");
++  });
++});
+diff --git a/packages/shim/src/require.js b/packages/shim/src/require.js
+index 5993e05..0d77516 100644
+--- a/packages/shim/src/require.js
++++ b/packages/shim/src/require.js
+@@ -15,6 +15,11 @@ import * as utilShim from "./node/util.js";
+ import { constantsShim } from "./node/constants.js";
+ import { assertShim } from "./node/assert.js";
+ import * as streamShim from "./node/stream.js";
++// local patch 0007: what a plugin that runs Claude Code needs besides child_process
++import * as readlineShim from "./node/readline.js";
++import * as stringDecoderShim from "./node/string_decoder.js";
++import * as asyncHooksShim from "./node/async_hooks.js";
++import * as moduleShim from "./node/module.js";
+ import { wrapWithProxy, installDebugHelpers } from "./debug.js";
+ 
+ const rawRegistry = {
+@@ -38,6 +43,11 @@ const rawRegistry = {
+   constants: constantsShim,
+   assert: assertShim,
+   stream: streamShim,
++  readline: readlineShim,
++  "readline/promises": readlineShim.promises,
++  string_decoder: stringDecoderShim,
++  async_hooks: asyncHooksShim,
++  module: moduleShim,
+ };
+ 
+ const shimRegistry = {};

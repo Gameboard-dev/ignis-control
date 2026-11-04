@@ -64,7 +64,7 @@ pipe is ended too.
 
 | Check | Rule | Result if it fails |
 | --- | --- | --- |
-| Known service | `augmented-view` or `latex` | 403 `no relayed service '<name>'` |
+| Known service | `augmented-view`, `quarry`, `latex` or `claude` | 403 `no relayed service '<name>'` |
 | Path form | The path (without the query) contains neither `..` nor `//` | 403 |
 | Allowlist | The method and path are listed for the service ([Services](#services)) | 403, and `relay: refused <method> <path>: <why>` in the log |
 | Service running | A connection to `127.0.0.1:<port>` succeeds within 5 s | 502 `nothing answers on port <port> for <path> (is the service running in desktop Obsidian?)` |
@@ -81,9 +81,10 @@ Paths are relative to `/relay/<service>`: `GET /health` for `augmented-view` is 
 
 | Service | Destination | Allowed requests | Refused requests |
 | --- | --- | --- | --- |
-| `augmented-view` | `127.0.0.1:<port>`; `IGNIS_AUGMENTED_VIEW_PORT` from the launcher's environment or `ignis\.env`, default 8790 (never the vault's `data.json`) | `GET /health`, `GET /stats`, `POST /emphasis`, `POST /claims` | Everything else, including `POST /shutdown` and `GET /docs` |
+| `augmented-view` | `127.0.0.1:<port>`; `IGNIS_AUGMENTED_VIEW_PORT` from the launcher's environment or `ignis\.env`, default 8790 (never the vault's `data.json`) | `GET /health`, `GET /stats`, `POST /emphasis`, `POST /colours` | Everything else, including `POST /shutdown` and `GET /docs` |
 | `quarry` | `127.0.0.1:<port>`; `IGNIS_QUARRY_PORT` from the launcher's environment or `ignis\.env`, default 8766 (never the vault's `data.json`) | The library, search, themes, citation trees, exclusions and credibility, indexing, and the review's reading and task-control tools ([the list](Plugin-Integration/Quarry.md#scope)); `POST /queue` without its `vault` and `config_dir` fields | Everything else, including the settings, keys, `POST /shutdown` and every assistant tool that writes |
 | `latex` | The launcher's build | `GET /status`, `POST /compile`, each with a valid Cloudflare Access token | Everything else under `/relay/latex/` (404); any request without a valid token (403) |
+| `claude` | The launcher's own Claude Code session, in the `<prefix>.claude` AppContainer | `GET /status`, `GET /output/<id>`, `POST /start` `/input/<id>` `/stop/<id>`, each with a valid Cloudflare Access token ([the list](Plugin-Integration/Claudian.md#scope)) | Everything else under `/relay/claude/` (404); any request without a valid token (403); a program name or command line from the browser, `--add-dir`, and arguments over the limits (400) |
 
 Per-service detail:
 

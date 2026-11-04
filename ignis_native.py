@@ -136,6 +136,9 @@ PORT = 8080
 LATEX_WATCHED = ("main.pdf", "main.shown.pdf", "main.synctex.gz", "latex-status.json")
 IGNORED_PATHS = config("IGNIS_IGNORED_PATHS", ",".join([
     "/LaTeX/compiled/*", *(f"!/LaTeX/compiled/{name}" for name in LATEX_WATCHED)]))
+# How deep the vault is searched for links that leave it (linked_out_of_vault): deep enough for a folder a few levels
+# down, shallow enough to cost nothing at start-up.
+LINK_SEARCH_DEPTH = 4
 # Capability SIDs: internetClient only (outgoing: plugins' requests through Ignis's proxy, cloudflared to Cloudflare)
 CAPABILITIES = ("S-1-15-3-1",)
 
@@ -206,15 +209,55 @@ def container_folder(sid: str) -> Path:
     return folder
 
 
-def grant(path: Path, sid: str, rights: str, inherit: bool = True, quiet: bool = False) -> bool:
-    """One access rule for the container (by default inherited by everything under a folder; icacls propagates it)."""
+def grant(path: Path, sid: str, rights: str, inherit: bool = True, quiet: bool = False,
+          timeout: Optional[float] = None) -> bool:
+    """One access rule for the container (by default inherited by everything under a folder; icacls propagates it).
+    With a `timeout`, one that has not finished in that many seconds counts as refused: icacls can sit for minutes
+    on a folder whose access list it may not change, such as C:\\ and C:\\Users, which belong to the system."""
     flags = "(OI)(CI)" if inherit and path.is_dir() else ""
-    r = subprocess.run([str(SYSTEM32 / "icacls.exe"), str(path), "/grant", f"*{sid}:{flags}({rights})", "/C"],
-                       capture_output=True, text=True, creationflags=NO_WINDOW)
+    try:
+        r = subprocess.run([str(SYSTEM32 / "icacls.exe"), str(path), "/grant", f"*{sid}:{flags}({rights})", "/C"],
+                           capture_output=True, text=True, creationflags=NO_WINDOW, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if not quiet:
+            print(f"  {rights:2} {path}  FAILED: icacls did not finish in {timeout:g} s")
+        return False
     ok = r.returncode == 0 and "Failed processing 0 files" in r.stdout  # with /C, icacls exits 0 even when refused
     if ok or not quiet:
         print(f"  {rights:2} {path}" + ("" if ok else f"  FAILED: {(r.stdout + r.stderr).strip()[-300:]}"))
     return ok
+
+
+def unshare(path: Path, sid: str, quiet: bool = False) -> bool:
+    """Put a folder out of a container's reach, while the folder around it stays in reach.
+
+    What does NOT work, tested on 2026-11-04: a deny rule. An AppContainer's access to a file is decided by whether
+    something in the access list *allows* its package SID; a deny rule naming that SID is written and shown by
+    icacls, and read straight through. `claude-probe` caught it. What works is taking the allowance away: the
+    folder stops inheriting the vault's rule, and the container's entry is removed from it, so nothing grants the
+    package SID anything and Windows refuses it as it refuses every other folder outside the fence.
+
+    A deny rule is written as well, after the allowance is gone: it costs nothing, it is correct as a statement of
+    intent, and it would take effect if Windows ever weighed it.
+    """
+    icacls = str(SYSTEM32 / "icacls.exe")
+    steps = [
+        # Keep what the folder has, then stop taking new rules from the vault above it.
+        [icacls, str(path), "/inheritance:d", "/C", "/Q"],
+        # Remove the container's allowance, from this folder and everything under it.
+        [icacls, str(path), "/remove:g", f"*{sid}", "/T", "/C", "/Q"],
+        # And say no, for the day Windows weighs a deny on a package SID.
+        [icacls, str(path), "/deny", f"*{sid}:(OI)(CI)(F)", "/C", "/Q"],
+    ]
+    for step in steps:
+        r = subprocess.run(step, capture_output=True, text=True, creationflags=NO_WINDOW)
+        if r.returncode != 0:
+            if not quiet:
+                print(f"  out {path}  FAILED at {step[2]}: {(r.stdout + r.stderr).strip()[-200:]}")
+            return False
+    if not quiet:
+        print(f"  out {path}")
+    return True
 
 
 def setup() -> int:
@@ -574,7 +617,7 @@ class Sandboxed:
 
     def __init__(self, args: list[str], env: dict[str, str], cwd: Path, job: wintypes.HANDLE,
                  container: Optional[tuple[ctypes.c_void_p, str]] = None, capabilities: tuple[str, ...] = CAPABILITIES,
-                 mitigation: int = 0) -> None:
+                 mitigation: int = 0, stdin: bool = False) -> None:
         psid, _ = container or container_sid()
         caps = (SID_AND_ATTRIBUTES * max(len(capabilities), 1))()
         for i, text in enumerate(capabilities):
@@ -589,7 +632,15 @@ class Sandboxed:
         if not k32.CreatePipe(ctypes.byref(read), ctypes.byref(write), ctypes.byref(sa), 0):
             raise ctypes.WinError(ctypes.get_last_error())
         k32.SetHandleInformation(read, 1, 0)  # the launcher's end stays out of the child
-        nul = wintypes.HANDLE(k32.CreateFileW("NUL", 0x80000000, 3, ctypes.byref(sa), 3, 0, None))
+        # The child's standard input: a pipe when the caller will write to it (`stdin`), else NUL as before
+        feed, written = wintypes.HANDLE(), wintypes.HANDLE()
+        if stdin:
+            if not k32.CreatePipe(ctypes.byref(feed), ctypes.byref(written), ctypes.byref(sa), 0):
+                raise ctypes.WinError(ctypes.get_last_error())
+            k32.SetHandleInformation(written, 1, 0)  # the launcher's writing end stays out of the child
+            nul = feed
+        else:
+            nul = wintypes.HANDLE(k32.CreateFileW("NUL", 0x80000000, 3, ctypes.byref(sa), 3, 0, None))
         # Only these two handles are inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), nothing else the launcher holds
         handles = (wintypes.HANDLE * 2)(write, nul)
 
@@ -628,6 +679,8 @@ class Sandboxed:
         self.process, self.pid = pi.hProcess, pi.dwProcessId
         import msvcrt
         self.output = os.fdopen(msvcrt.open_osfhandle(read.value or 0, os.O_RDONLY), "rb")
+        self.input = (os.fdopen(msvcrt.open_osfhandle(written.value or 0, os.O_WRONLY), "wb")
+                      if stdin else None)
 
     def wait(self) -> int:
         k32.WaitForSingleObject(self.process, 0xFFFFFFFF)
@@ -637,10 +690,55 @@ class Sandboxed:
         return code.value
 
 
+def linked_out_of_vault(depth: int = LINK_SEARCH_DEPTH) -> list[str]:
+    """The vault's own junctions and symbolic links whose target is not inside the vault, as paths relative to it.
+
+    Ignis is told not to watch them. Such a link cannot be served in any case: Ignis resolves every path and refuses
+    one whose real location is outside the vault (`resolveVaultPath` in packages/server-core/src/path-utils.js), which
+    is a guard worth keeping -- anyone who got past Cloudflare Access would otherwise be able to read whatever a link
+    in the vault points at. Left in the watcher's way, each one costs a line of `EPERM: operation not permitted, stat`
+    per crawl when the target is outside what the AppContainer may open, which is the usual case.
+
+    Granting the container access to the targets instead would silence the watcher but still not serve the files, so
+    this takes nothing away. Links are not followed while searching, so a loop cannot occur.
+    """
+    found: list[str] = []
+    base = VAULT.resolve()
+
+    def walk(folder: Path, left: int) -> None:
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                link = entry.is_junction() if hasattr(entry, "is_junction") else False
+                link = link or entry.is_symlink()
+            except OSError:
+                continue
+            if link:
+                try:
+                    target = Path(entry.path).resolve()
+                    inside = target == base or base in target.parents
+                except OSError:
+                    inside = False  # a broken link: nothing to watch either way
+                if not inside:
+                    found.append("/" + str(Path(entry.path).relative_to(base)).replace("\\", "/"))
+                continue  # never followed: a link cannot lead the search out of the vault
+            if left > 1 and entry.is_dir(follow_symlinks=False):
+                walk(Path(entry.path), left - 1)
+
+    walk(base, depth)
+    return sorted(found)
+
+
 def ignis_env(sid: str) -> dict[str, str]:
     folder = container_folder(sid)
     temp = folder / "Temp"
     temp.mkdir(exist_ok=True)
+    linked_away = linked_out_of_vault()
+    if linked_away:
+        log(f"not watched, a link out of the vault which Ignis cannot serve in any case: {', '.join(linked_away)}")
     return {
         # Ignis's settings: https://ignis.thiefling.com/docs/server/environment/
         "PORT": str(PORT),
@@ -649,7 +747,7 @@ def ignis_env(sid: str) -> dict[str, str]:
         "DATA_ROOT": str(DATA),
         "OBSIDIAN_ASSETS_PATH": str(OBSIDIAN_APP),
         "IGNIS_OBSIDIAN_PIN": (OBSIDIAN_APP / ".obsidian-version").read_text(encoding="utf-8").strip(),
-        "IGNORED_PATHS": IGNORED_PATHS,
+        "IGNORED_PATHS": ",".join([IGNORED_PATHS, *linked_away]).strip(","),
         # Ignis's proxy may reach 127.0.0.1, which inside the container is only Ignis, cloudflared and the
         # Augmented View forwarder (the container cannot reach this PC's loopback)
         "PROXY_ALLOW_PRIVATE_HOSTS": "127.0.0.1",
@@ -759,7 +857,7 @@ def set_token() -> int:
 RELAY_PORT = 18790
 PIPE = rf"\\.\pipe\{PREFIX}-ignis-augmented-view"
 FORWARDER = IGNIS / "relay" / "augmented-view-forwarder.js"
-AUGMENTED_VIEW_ALLOWED = {("GET", "/health"), ("GET", "/stats"), ("POST", "/emphasis"), ("POST", "/claims")}
+AUGMENTED_VIEW_ALLOWED = {("GET", "/health"), ("GET", "/stats"), ("POST", "/emphasis"), ("POST", "/colours")}
 AUGMENTED_VIEW_DEFAULT_PORT = 8790  # the Augmented View server's own default (its --port)
 
 
@@ -922,7 +1020,7 @@ def access_email(token: str) -> str:
     team, aud, emails = cfg
     parts = token.split(".")
     if len(parts) != 3:
-        raise ValueError("no Cloudflare Access token (a build is asked for only through the tunnel)")
+        raise ValueError("no Cloudflare Access token (this is asked for only through the tunnel, where Access adds one)")
     d = lambda t: base64.urlsafe_b64decode(t + "=" * (-len(t) % 4))
     head, claims, sig = json.loads(d(parts[0])), json.loads(d(parts[1])), d(parts[2])
     if head.get("alg") != "RS256":
@@ -1125,6 +1223,486 @@ def latex_relay(conn: "PipeConnection", method: str, own: str, headers: list[str
     return answer("404 Not Found", {"error": f"{method} /latex{own} is not a build request"})
 
 
+# --- Claude Code, run for the Claudian plugin in the browser ---
+# Claudian (realclaudian) embeds the Claude Agent SDK, which starts the Claude Code CLI as a child process and talks
+# to it over its standard input and output. A browser cannot start a process, so Ignis's shim for Node's
+# child_process throws (patches/0007-spawn.patch replaces its spawn with one that asks for this service instead).
+# The launcher starts the CLI itself, in an AppContainer of its own (CLAUDE_CONTAINER) that may change the vault and
+# its own folder and nothing else; its configuration and its sign-in live in CLAUDE_DIR, outside the vault, so a
+# browser cannot read them (Ignis serves the vault, not this folder). The plugin never says which program to run:
+# the launcher finds the CLI itself and passes only the arguments after it. Each request must carry a valid
+# Cloudflare Access token, as the LaTeX build's do.
+#
+#   POST /relay/claude/start      {"args": [...]} -> {"id", "pid"}: the CLI started, the arguments checked
+#   GET  /relay/claude/output/ID  the CLI's output as it comes, base64 in server-sent events, then its exit code
+#   POST /relay/claude/input/ID   the body written to the CLI's standard input
+#   POST /relay/claude/stop/ID    the CLI stopped
+#   GET  /relay/claude/status     whether it can run, and the sessions now running
+
+CLAUDE_CONTAINER = f"{PREFIX}.claude"
+# The sandboxed CLI's CLAUDE_CONFIG_DIR, HOME and TEMP. Never inside the vault, so a browser cannot download the
+# sign-in; and never inside `data`, which Ignis's own container may change: everything under it is granted to that
+# container, so the sign-in kept there could be read by Ignis if Ignis were ever compromised, which is the thing a
+# container of its own is for. `ignis` itself carries only a read-attributes rule, which is not inherited, so this
+# folder starts with no rule for any container but the one granted below.
+CLAUDE_DIR = IGNIS / "claude"
+# Obsidian's own folder in the vault, which holds every plugin's code. Refused to the CLI's container: see
+# claude_setup. IGNIS_VAULT_CONFIG matches Obsidian's "Override config folder" setting when it is not the default.
+VAULT_CONFIG = config("IGNIS_VAULT_CONFIG", ".obsidian")
+CLAUDE_AT_ONCE = 4  # the most sessions at once (one browser tab needs one)
+CLAUDE_IDLE = 1800.0  # a session whose output nothing is reading for this long is stopped
+CLAUDE_INPUT_LIMIT = 1 << 20  # the most one write to the CLI's input may carry
+CLAUDE_ARGS_LIMIT = 1 << 18  # the most all the arguments of one start may carry
+CLAUDE_ARGS_COUNT = 400
+# Arguments refused: --add-dir would ask the CLI to work outside the vault (the container's rules stop it reaching
+# anywhere else in any case, so this only makes the refusal clear instead of a puzzling permission error).
+CLAUDE_REFUSED = ("--add-dir",)
+# Where the CLI is looked for when ignis/.env does not name it (IGNIS_CLAUDE_CLI), in this order: the folders of the
+# launcher's PATH, then winget's package folder, then the places the CLI's own installers use.
+CLAUDE_PLACES = (
+    r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Anthropic.ClaudeCode_*",
+    r"%LOCALAPPDATA%\Programs\claude",
+    r"%USERPROFILE%\.local\bin",
+    r"%USERPROFILE%\.claude\local",
+)
+# The CLI looks for its own antivirus root certificate here (it reported "Ignoring extra certs from ... load failed:
+# Operation not permitted" without it); granted read-only when the file exists, as CA_CERT is.
+ANTIVIRUS_CERT = Path(config("IGNIS_ANTIVIRUS_CERT", str(Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+                                                        / "Norton" / "Antivirus" / "wscert.pem")))
+_CLAUDE_SID: Optional[tuple[ctypes.c_void_p, str]] = None
+_CLAUDE_JOB: Optional[wintypes.HANDLE] = None
+_CLAUDE_LOCK = threading.Lock()  # the sessions; a session is started while it is held, so nothing it calls may take it
+_CLAUDE_JOB_LOCK = threading.Lock()
+CLAUDE_RUNNING: dict[str, "ClaudeSession"] = {}
+
+
+def claude_sid() -> tuple[ctypes.c_void_p, str]:
+    global _CLAUDE_SID
+    with _SID_LOCK:
+        if _CLAUDE_SID is None:
+            _CLAUDE_SID = _lookup_container_sid(CLAUDE_CONTAINER, "Ignis Claude Code",
+                                                "Runs Claude Code on the vault for the Claudian plugin")
+        return _CLAUDE_SID
+
+
+def claude_job() -> wintypes.HANDLE:
+    """One job object for every session, so none outlives the launcher."""
+    global _CLAUDE_JOB
+    with _CLAUDE_JOB_LOCK:
+        if _CLAUDE_JOB is None:
+            _CLAUDE_JOB = kill_on_close_job()
+        return _CLAUDE_JOB
+
+
+def claude_cli() -> Optional[Path]:
+    """The Claude Code CLI's own executable, named by IGNIS_CLAUDE_CLI or found in CLAUDE_PLACES and on PATH.
+    Only a real .exe is accepted: a .cmd or .ps1 would need a command interpreter to start it."""
+    named = config("IGNIS_CLAUDE_CLI")
+    if named:
+        path = Path(os.path.expandvars(named))
+        return path if path.is_file() and path.suffix.lower() == ".exe" else None
+    folders = [Path(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p.strip()]
+    for place in CLAUDE_PLACES:
+        pattern = os.path.expandvars(place)
+        folders += [p for p in sorted(Path(pattern).parent.glob(Path(pattern).name), reverse=True) if p.is_dir()] \
+            if "*" in pattern else [Path(pattern)]
+    for folder in folders:
+        try:
+            cli = folder / "claude.exe"
+            if cli.is_file():
+                return cli.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def claude_ready() -> Optional[str]:
+    """Why Claude Code cannot be run for the browser, or None."""
+    if claude_cli() is None:
+        return ("the Claude Code CLI was not found: install it (https://docs.claude.com/en/docs/claude-code), or "
+                "name claude.exe in a line IGNIS_CLAUDE_CLI=<path> in ignis/.env")
+    # The CLI makes its configuration folder itself the first time it runs, so the folder's being there says nothing.
+    # What says it has signed in is the credentials file it writes there.
+    if not (CLAUDE_DIR / ".claude" / ".credentials.json").is_file():
+        return (f"the sandboxed CLI has not signed in yet: run `python {IGNIS.name}\\{Path(__file__).name} "
+                f"claude-login` once on this PC (its configuration folder alone, which the CLI creates on its own, "
+                f"is not a sign-in)")
+    if access_config() is None:
+        return ("Cloudflare Access is not configured: set IGNIS_ACCESS_TEAM, IGNIS_ACCESS_AUD and "
+                "IGNIS_ACCESS_EMAILS in ignis/.env (as the LaTeX build needs them)")
+    return None
+
+
+def claude_setup() -> int:
+    """The session container's access rules: the vault, its own folder, and the CLI's folder to read and run.
+    Run once (and again after the CLI moves); the vault's rule is inherited, as the Ignis container's is."""
+    _, sid = claude_sid()
+    print(f"AppContainer {CLAUDE_CONTAINER}: {sid}")
+    for folder in (CLAUDE_DIR, CLAUDE_DIR / "temp", CLAUDE_DIR / "AppData" / "Roaming",
+                   CLAUDE_DIR / "AppData" / "Local"):
+        folder.mkdir(parents=True, exist_ok=True)
+    print("granting:")
+    grant(CLAUDE_DIR, sid, "M")
+    grant(VAULT, sid, "M")
+    cli = claude_cli()
+    if cli is None:
+        print(f"\n{claude_ready()}")
+        return 1
+    print(f"  the CLI: {cli}")
+    grant(cli.parent, sid, "RX")
+    if CA_CERT.is_file():  # that one file, not the runtime folder around it
+        grant(CA_CERT, sid, "RX")
+    # The CLI looks for the antivirus's own certificate as well. Antivirus software usually refuses to let anything
+    # change the access list of its folder, so this is attempted quietly: NODE_EXTRA_CA_CERTS (CA_CERT, a copy of the
+    # same certificate kept in ignis/runtime) is what the session actually uses.
+    if ANTIVIRUS_CERT.is_file() and not grant(ANTIVIRUS_CERT, sid, "RX", quiet=True):
+        print(f"  (not readable to the sandbox, which only warns about it: {ANTIVIRUS_CERT})")
+    # The folders on the way down are not granted: unlike Ignis's own Node, the CLI starts without them (proved by
+    # `claude-check`). If a session ever fails to start with a permission error, that is the thing to try:
+    #   icacls '<each folder from C:\ down to the CLI>' /grant '*<the SID above>:(RA)'
+    # The one way a session could reach beyond the vault: `.obsidian` holds the plugins' own code, which desktop
+    # Obsidian runs as you, with none of this sandbox around it. A session that could write there could put code on
+    # the next start of Obsidian. Nothing the CLI does needs that folder -- the plugin's settings are written by the
+    # browser through Ignis, not by the CLI -- so it is refused outright. A refusal is inherited, so it covers what
+    # is added to the folder later, and Windows applies it before the rule that allows the rest of the vault.
+    print("out of the container's reach, although the rest of the vault is in it:")
+    unshare(VAULT / VAULT_CONFIG, sid)
+    print("\nNext: `claude-login` once (the sandbox signs in for itself), then `claude-check` and `claude-probe`.")
+    return 0
+
+
+def claude_login() -> int:
+    """Sign the sandboxed CLI in, once: the CLI is run here as you, in this console, with its configuration folder
+    set to CLAUDE_DIR, so the sign-in it writes belongs to the sandbox alone and your own ~/.claude is untouched.
+    Type /login in it, follow the browser, then /exit."""
+    cli = claude_cli()
+    if cli is None:
+        print(claude_ready())
+        return 1
+    folder = CLAUDE_DIR / ".claude"
+    folder.mkdir(parents=True, exist_ok=True)
+    print(f"Signing in the sandbox's own Claude Code, whose configuration is {folder}\n"
+          f"(your own ~/.claude is not read or changed, and the sandbox cannot read it).\n"
+          f"In the CLI: type /login, follow the browser, then /exit.\n")
+    env = {**os.environ, "CLAUDE_CONFIG_DIR": str(folder)}
+    return subprocess.run([str(cli)], env=env, cwd=str(CLAUDE_DIR)).returncode
+
+
+def claude_check() -> int:
+    """Prove a session can start: run the CLI in its container and print what it says."""
+    cli = claude_cli()
+    print(f"CLI: {cli}")
+    print(f"container: {CLAUDE_CONTAINER} ({claude_sid()[1]})")
+    print(f"configuration: {CLAUDE_DIR / '.claude'}")
+    why = claude_ready()
+    print(f"ready: {'yes' if why is None else 'no -- ' + why}")
+    if cli is None:
+        return 1
+    job = claude_job()
+    for args in (["--version"], ["-p", "Reply with the two words: sandbox ok", "--output-format", "text"]):
+        print(f"\nin the container: claude.exe {' '.join(args)}")
+        try:
+            proc = Sandboxed([str(cli), *args], claude_env(cli), VAULT, job, container=claude_sid())
+        except OSError as e:
+            print(f"  did not start: {e}")
+            return 1
+        collected: list[bytes] = []
+        reader = threading.Thread(target=lambda: collected.append(proc.output.read()), daemon=True)
+        reader.start()
+        if k32.WaitForSingleObject(proc.process, 120000) != 0:
+            print("  still running after 120 s; stopping it")
+            k32.TerminateProcess(proc.process, 1)
+        code = wintypes.DWORD()
+        k32.GetExitCodeProcess(proc.process, ctypes.byref(code))
+        reader.join(5)
+        said = (collected[0] if collected else b"").decode("utf-8", "replace").strip()
+        print(f"  exit {code.value}: {said[:2000] or '(nothing)'}")
+        if code.value != 0:
+            return 1
+    return 0
+
+
+def claude_probe() -> int:
+    """Prove the CLI's sandbox from inside it: what a session may read, write and run, and what it may not.
+
+    Each probe is one short program started in the container, as a session is, and is judged by whether it could
+    reach the thing named. Nothing is taken on trust from the access lists: this is what Windows actually allows.
+    The program is cmd.exe (readable to every AppContainer, so nothing has to be granted for the test) and every
+    argument is a constant from this file; nothing comes from the vault, the browser or the environment.
+    """
+    _, sid = claude_sid()
+    print(f"AppContainer {CLAUDE_CONTAINER}: {sid}\n")
+    job = claude_job()
+    cmd = SYSTEM32 / "cmd.exe"
+    env = claude_env(claude_cli() or cmd)
+    scratch = CLAUDE_DIR / "temp"
+    scratch.mkdir(parents=True, exist_ok=True)
+    note = next((p for p in VAULT.glob("*.md")), None)
+
+    # (what it is, the program's arguments, whether a session SHOULD be able to do it)
+    probes: list[tuple[str, list[str], bool]] = [
+        ("read a note in the vault", ["type", str(note)] if note else ["dir", "/b", str(VAULT)], True),
+        ("write in the vault", ["cmd", "/c", f"echo probe> {VAULT / '.ignis-probe.tmp'}"], True),
+        ("read its own sign-in", ["type", str(CLAUDE_DIR / ".claude" / ".credentials.json")], True),
+        (f"read the vault's {VAULT_CONFIG} (plugin code, run by desktop Obsidian as you)",
+         ["type", str(VAULT / VAULT_CONFIG / "app.json")], False),
+        (f"write in the vault's {VAULT_CONFIG}",
+         ["cmd", "/c", f"echo probe> {VAULT / VAULT_CONFIG / '.ignis-probe.tmp'}"], False),
+        ("read Ignis's own state", ["dir", "/b", str(DATA)], False),
+        ("read Ignis's program files", ["dir", "/b", str(APP)], False),
+        ("read your own Claude sign-in", ["type", str(Path.home() / ".claude" / ".credentials.json")], False),
+        ("read this project's CLAUDE.md", ["type", str(ROOT / "CLAUDE.md")], False),
+        ("list your Documents", ["dir", "/b", str(Path.home() / "Documents")], False),
+        ("read your SSH keys", ["dir", "/b", str(Path.home() / ".ssh")], False),
+        ("list the other drive", ["dir", "/b", "D:\\"], False),
+        ("plant a junction in the vault",
+         ["mklink", "/J", str(VAULT / ".ignis-probe-link"), str(VAULTS)], False),
+    ]
+
+    wrong = 0
+    for what, args, should in probes:
+        full = [str(cmd), "/c", *args] if args[0] != "cmd" else [str(cmd), "/c", *args[2:]]
+        try:
+            proc = Sandboxed(full, env, scratch, job, container=claude_sid())
+        except OSError as e:
+            print(f"  ?  {what}: could not be tested ({e})")
+            wrong += 1
+            continue
+        said = proc.output.read().decode("utf-8", "replace").strip()
+        allowed = proc.wait() == 0
+        ok = allowed == should
+        wrong += 0 if ok else 1
+        verdict = "allowed" if allowed else "refused"
+        print(f"  {'ok ' if ok else 'BAD'} {verdict:8} {what}"
+              + ("" if ok else f"  <- expected {'allowed' if should else 'refused'}"
+                               f"{': ' + said.splitlines()[0] if said else ''}"))
+
+    for leftover in (VAULT / ".ignis-probe.tmp", VAULT / VAULT_CONFIG / ".ignis-probe.tmp"):
+        leftover.unlink(missing_ok=True)
+    link = VAULT / ".ignis-probe-link"
+    if link.is_dir():
+        link.rmdir()
+
+    print(f"\n{'every probe behaved as it should' if not wrong else f'{wrong} probe(s) did NOT behave as they should'}")
+    return 1 if wrong else 0
+
+
+def claude_env(cli: Path) -> dict[str, str]:
+    """The whole environment a session gets: a fixed list, with its home, temporary and configuration folders inside
+    CLAUDE_DIR, so nothing of yours is read or written and the sign-in stays out of the vault. Nothing from the
+    browser reaches it. (A short list is not enough: CreateProcessW refuses one that lacks what Windows expects.)"""
+    kept = ("SystemRoot", "windir", "SystemDrive", "COMSPEC", "PATHEXT", "OS", "NUMBER_OF_PROCESSORS",
+            "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "ProgramData", "ProgramFiles", "ProgramFiles(x86)",
+            "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "PUBLIC", "ALLUSERSPROFILE",
+            "COMPUTERNAME", "USERNAME", "TZ")
+    env = {name: os.environ[name] for name in kept if name in os.environ}
+    drive, _, rest = str(CLAUDE_DIR).partition("\\")
+    env.update({
+        "PATH": os.pathsep.join([str(cli.parent), str(SYSTEM32), str(SYSTEM32 / "WindowsPowerShell" / "v1.0")]),
+        "HOME": str(CLAUDE_DIR),
+        "USERPROFILE": str(CLAUDE_DIR),
+        "HOMEDRIVE": drive,
+        "HOMEPATH": "\\" + rest,
+        "APPDATA": str(CLAUDE_DIR / "AppData" / "Roaming"),
+        "LOCALAPPDATA": str(CLAUDE_DIR / "AppData" / "Local"),
+        "TEMP": str(CLAUDE_DIR / "temp"),
+        "TMP": str(CLAUDE_DIR / "temp"),
+        "CLAUDE_CONFIG_DIR": str(CLAUDE_DIR / ".claude"),
+    })
+    if CA_CERT.is_file():  # antivirus software that re-signs TLS: the CLI's own Node is told to trust its root
+        env["NODE_EXTRA_CA_CERTS"] = str(CA_CERT)
+    return env
+
+
+def claude_args(value: Any) -> tuple[Optional[list[str]], str]:
+    """The arguments of a start request as the CLI will receive them, or None and why they are refused. The program
+    itself is never taken from the request: only what follows it, each one a string passed on as an argument (an
+    array, never a command line: nothing in it can start another program)."""
+    if not isinstance(value, list) or not all(isinstance(a, str) for a in value):
+        return None, "args must be a list of strings"
+    if len(value) > CLAUDE_ARGS_COUNT:
+        return None, f"more than {CLAUDE_ARGS_COUNT} arguments"
+    if sum(len(a) for a in value) > CLAUDE_ARGS_LIMIT:
+        return None, f"the arguments are longer than {CLAUDE_ARGS_LIMIT} characters together"
+    for arg in value:
+        if "\0" in arg:
+            return None, "an argument holds a null character"
+        if arg.split("=")[0] in CLAUDE_REFUSED:
+            return None, f"{arg.split('=')[0]} is not allowed: a session works on the vault only"
+    return list(value), ""
+
+
+class ClaudeSession:
+    """One run of the CLI in the container: its output read into a queue as it comes, its input written on request."""
+
+    def __init__(self, args: list[str], cli: Path, who: str) -> None:
+        import secrets
+        self.id = secrets.token_hex(8)
+        self.who = who
+        self.started = time.time()
+        self.touched = self.started
+        self.exit: Optional[int] = None
+        self.taken = False  # whether something is reading the output already
+        self.chunks: list[bytes] = []
+        self.ready = threading.Event()
+        self.lock = threading.Lock()
+        self.process = Sandboxed([str(cli), *args], claude_env(cli), VAULT, claude_job(),
+                                 container=claude_sid(), stdin=True)
+        self.pid = self.process.pid
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        try:
+            while chunk := self.process.output.read1(65536):
+                with self.lock:
+                    self.chunks.append(chunk)
+                self.ready.set()
+        except OSError:
+            pass
+        code = self.process.wait()
+        with self.lock:
+            self.exit = code
+        self.ready.set()
+        log(f"claude: session {self.id} (pid {self.pid}) ended, exit {code}")
+
+    def take(self) -> list[bytes]:
+        with self.lock:
+            chunks, self.chunks = self.chunks, []
+        self.ready.clear()
+        return chunks
+
+    def write(self, data: bytes) -> None:
+        self.process.input.write(data)
+        self.process.input.flush()
+        self.touched = time.time()
+
+    def stop(self) -> None:
+        with self.lock:
+            if self.exit is None:
+                k32.TerminateProcess(self.process.process, 1)
+        try:
+            self.process.input.close()
+        except OSError:
+            pass
+
+
+def claude_reap() -> None:
+    """Forget the sessions that have ended, and stop one nothing has read for CLAUDE_IDLE seconds."""
+    with _CLAUDE_LOCK:
+        for sid, session in list(CLAUDE_RUNNING.items()):
+            idle = time.time() - session.touched
+            if session.exit is not None and not session.chunks:
+                del CLAUDE_RUNNING[sid]
+            elif idle > CLAUDE_IDLE:
+                log(f"claude: session {sid} stopped after {idle / 60:.0f} minutes with nothing reading it")
+                session.stop()
+                del CLAUDE_RUNNING[sid]
+
+
+def claude_relay(conn: "PipeConnection", method: str, own: str, headers: list[str], rest: bytes = b"") -> None:
+    """/claude/...: each request with a valid Cloudflare Access token, else refused. One answer per connection;
+    the output of a session streams until the CLI ends."""
+    def answer(status: str, body: dict[str, Any]) -> None:
+        data = json.dumps(body).encode()
+        conn.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n"
+                   f"Connection: close\r\n\r\n".encode() + data)
+        conn.close()
+
+    token = next((h.split(":", 1)[1].strip() for h in headers if h.lower().startswith("cf-access-jwt-assertion:")), "")
+    try:
+        email = access_email(token)
+    except Exception as e:  # noqa: BLE001
+        log(f"relay: claude refused ({e})")
+        return answer("403 Forbidden", {"error": str(e)})
+
+    claude_reap()
+    where, _, ident = own.lstrip("/").partition("/")
+    session = CLAUDE_RUNNING.get(ident)
+    if where in ("output", "input", "stop") and session is None:
+        return answer("404 Not Found", {"error": f"no session {ident!r} (it may have ended; start another)"})
+
+    if method == "GET" and where == "status":
+        why = claude_ready()
+        cli = claude_cli()
+        return answer("200 OK", {"available": why is None, "why": why, "cli": str(cli) if cli else None,
+                                 "container": CLAUDE_CONTAINER,
+                                 "sessions": [{"id": s.id, "pid": s.pid, "seconds": round(time.time() - s.started, 1),
+                                               "exit": s.exit} for s in CLAUDE_RUNNING.values()]})
+
+    if method == "POST" and where == "start":
+        why = claude_ready()
+        if why:
+            return answer("503 Service Unavailable", {"error": why})
+        body, read_why = read_body(conn, headers, rest)
+        if body is None:
+            return answer("400 Bad Request", {"error": read_why})
+        args, args_why = claude_args((body or {}).get("args", []))
+        if args is None:
+            log(f"relay: claude refused start ({args_why})")
+            return answer("400 Bad Request", {"error": args_why})
+        with _CLAUDE_LOCK:
+            if len(CLAUDE_RUNNING) >= CLAUDE_AT_ONCE:
+                return answer("429 Too Many Requests",
+                              {"error": f"{CLAUDE_AT_ONCE} sessions are running already; close a tab and try again"})
+            cli = claude_cli()
+            assert cli is not None
+            try:
+                session = ClaudeSession(args, cli, email)
+            except OSError as e:
+                log(f"claude: could not start the CLI in {CLAUDE_CONTAINER}: {e}")
+                return answer("500 Internal Server Error",
+                              {"error": f"the CLI did not start in the sandbox: {e}. Has "
+                                        f"`claude-setup` been run, and the two rules an administrator grants?"})
+            CLAUDE_RUNNING[session.id] = session
+        log(f"claude: session {session.id} (pid {session.pid}) started for {email}: {len(args)} arguments")
+        return answer("200 OK", {"id": session.id, "pid": session.pid})
+
+    if method == "POST" and where == "input" and session is not None:
+        body, read_why = read_body(conn, headers, rest, limit=CLAUDE_INPUT_LIMIT, raw=True)
+        if body is None:
+            return answer("400 Bad Request", {"error": read_why})
+        try:
+            session.write(body)
+        except OSError as e:
+            return answer("409 Conflict", {"error": f"the CLI is no longer reading its input: {e}"})
+        return answer("200 OK", {"written": len(body)})
+
+    if method == "POST" and where == "stop" and session is not None:
+        session.stop()
+        return answer("200 OK", {"stopped": True})
+
+    if method == "GET" and where == "output" and session is not None:
+        if session.taken:
+            return answer("409 Conflict", {"error": "something is reading this session's output already"})
+        session.taken = True
+        import base64
+        conn.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                   b"X-Accel-Buffering: no\r\nConnection: close\r\n\r\n")
+        while True:
+            session.ready.wait(15.0)
+            session.touched = time.time()
+            chunks = session.take()
+            for chunk in chunks:
+                if not conn.write(b"data: " + base64.b64encode(chunk) + b"\n\n"):
+                    chunks = None  # the browser went away
+                    break
+            if chunks is None:
+                break
+            if session.exit is not None:
+                conn.write(f"event: exit\ndata: {session.exit}\n\n".encode())
+                break
+            if not chunks:
+                conn.write(b": waiting\n\n")  # keeps the connection from being closed as idle
+        if session.exit is None:
+            log(f"claude: session {session.id} stopped: nothing is reading its output any more")
+            session.stop()
+        session.taken = False
+        conn.close()
+        return None
+
+    return answer("404 Not Found", {"error": f"{method} /claude{own} is not a Claude Code request"})
+
+
 # --- the same-origin relay (patches/0006-relay.patch) ---
 # A plugin in the browser asks <page origin>/relay/<service>/<path>; Ignis's server streams it through LOCAL_RELAY_PIPE
 # (its name passed in IGNIS_LOCAL_RELAY) to `relay` below, which passes only the requests in that service's list to
@@ -1146,7 +1724,7 @@ BODY_FILTERS: dict[tuple[str, str, str], Callable[[Any], Any]] = {
 BODY_LIMIT = 1 << 20
 # Other services on this PC that no relayed service's requests may be sent to (the relayed services' own ports are
 # checked against each other as well): Ignis itself and the forwarder in the sandbox.
-OTHER_PORTS = {"Ignis": PORT, "the Augmented View forwarder": RELAY_PORT}
+OTHER_PORTS = {"Ignis": PORT, "the Augmented View forwarder": RELAY_PORT, "Zotero's local API": 23119}
 
 
 def destination(service: str) -> tuple[Optional[int], str]:
@@ -1268,6 +1846,31 @@ def filtered_body(conn: PipeConnection, headers: list[str], rest: bytes, body_fi
     return json.dumps(out).encode("utf-8"), ""
 
 
+def read_body(conn: PipeConnection, headers: list[str], rest: bytes, limit: int = BODY_LIMIT,
+              raw: bool = False) -> tuple[Any, str]:
+    """The whole body of a request the launcher answers itself (its Content-Length, at most `limit`; no chunked
+    encoding): the bytes when `raw`, else the JSON object in it. None and why when it cannot be read."""
+    lengths = [h.split(":", 1)[1].strip() for h in headers if h.lower().startswith("content-length:")]
+    if any(h.lower().startswith("transfer-encoding:") for h in headers) or len(lengths) != 1 or not lengths[0].isdigit():
+        return None, "this request needs a single Content-Length (no chunked body)"
+    length = int(lengths[0])
+    if length > limit:
+        return None, f"the body is larger than {limit} bytes"
+    body = rest
+    while len(body) < length:
+        chunk = conn.read()
+        if not chunk:
+            return None, "the body ended early"
+        body += chunk
+    body = body[:length]
+    if raw:
+        return body, ""
+    try:
+        return json.loads(body.decode("utf-8") or "{}"), ""
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, f"the body is not JSON ({e})"
+
+
 def relay_one(conn: PipeConnection, route: Route = route_augmented_view) -> None:
     """One request: `route` says whether it passes and to which port and path; the request goes to that service on
     this PC and the answer streams back."""
@@ -1286,6 +1889,9 @@ def relay_one(conn: PipeConnection, route: Route = route_augmented_view) -> None
     path = target.split("?")[0]
     if route is route_local and target.startswith("/latex/"):
         latex_relay(conn, method, path[len("/latex"):], headers)
+        return
+    if route is route_local and target.startswith("/claude/"):
+        claude_relay(conn, method, path[len("/claude"):], headers, rest)
         return
     where, why = route(method, target) if method else (None, "not an HTTP request")
     if where is None:
@@ -1669,12 +2275,16 @@ def require_vault() -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("setup", "exempt", "unexempt", "check", "repair", "set-token", "run", "install-startup"):
+    for c in ("setup", "exempt", "unexempt", "check", "repair", "set-token", "run", "install-startup",
+              "claude-setup", "claude-login", "claude-check", "claude-probe"):
         sub.add_parser(c)
     args = ap.parse_args()
-    if args.cmd in ("setup", "check", "repair", "run"):
+    if args.cmd in ("setup", "check", "repair", "run", "claude-setup", "claude-check", "claude-probe"):
         require_vault()
-    return {"setup": setup, "exempt": exempt, "unexempt": unexempt, "check": check, "repair": repair, "set-token": set_token, "run": run, "install-startup": install_startup}[args.cmd]()
+    return {"setup": setup, "exempt": exempt, "unexempt": unexempt, "check": check, "repair": repair,
+            "set-token": set_token, "run": run, "install-startup": install_startup,
+            "claude-setup": claude_setup, "claude-login": claude_login, "claude-check": claude_check,
+            "claude-probe": claude_probe}[args.cmd]()
 
 
 if __name__ == "__main__":

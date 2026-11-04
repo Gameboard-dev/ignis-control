@@ -44,7 +44,7 @@ disclose, so you know what you install. In short (the full account is [docs/disc
 | Launcher | `ignis_native.py` (Python) | Runs Ignis and cloudflared in a Windows AppContainer, restarts them when they exit, writes the status file, serves the relay, runs the LaTeX build |
 | Forwarder | `relay/augmented-view-forwarder.js` | Runs inside the sandbox and passes Augmented View's requests to the launcher (older route) |
 | Access watcher (optional) | `launcher/` (Rust) | Restores the sandbox's access rule on files moved into the vault, as they arrive |
-| Patches | `patches/` | Six changes to Ignis 0.8.18 that the launcher and the plugin depend on |
+| Patches | `patches/` | Seven changes to Ignis 0.8.18 that the launcher and the plugin depend on |
 
 ## Features
 
@@ -116,7 +116,7 @@ disclose, so you know what you install. In short (the full account is [docs/disc
 | [Building and testing](docs/building.md) | The plugin (no build step), the access watcher, the tests, the patches |
 | [Disclosures](docs/disclosures.md) | What the plugin and the launcher run, connect to and read, under Obsidian's developer policies |
 | [Licences](docs/licences.md) | This repository's licences, Ignis's, and the programs it runs |
-| [patches/README.md](patches/README.md) | The six Ignis patches and how to apply them |
+| [patches/README.md](patches/README.md) | The seven Ignis patches and how to apply them |
 | [launcher/README.md](launcher/README.md) | The Rust access watcher |
 
 <a name="with-the-latex-plugin-remote-markdown-to-latex-compilation"></a>
