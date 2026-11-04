@@ -232,6 +232,42 @@ index 40050b6..1fe77cc 100644
    console.log(`[ignis] Vault root: ${config.vaultRoot}`);
    console.log(`[ignis] Vaults: ${Object.keys(config.vaults).join(", ")}`);
  
+diff --git a/packages/shim/src/crypto/index.js b/packages/shim/src/crypto/index.js
+index 6272a20..042bde0 100644
+--- a/packages/shim/src/crypto/index.js
++++ b/packages/shim/src/crypto/index.js
+@@ -3,8 +3,31 @@ import { createHash } from "./create-hash.js";
+ import { scrypt } from "./scrypt.js";
+ import { randomUUID } from "./random-uuid.js";
+ 
++// local patch 0007: Node's randomFillSync fills a buffer the caller already has, rather than making one. The ws
++// library bundled into the Claudian plugin uses it to mask each frame it sends, and warned "[shim:MISS]" without it.
++function randomFillSync(buffer, offset = 0, size) {
++  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer.buffer ?? buffer);
++  const length = size === undefined ? bytes.length - offset : size;
++  bytes.set(randomBytes(length), offset);
++  return buffer;
++}
++
++function randomFill(buffer, offset, size, callback) {
++  if (typeof offset === "function") [offset, size, callback] = [0, undefined, offset];
++  else if (typeof size === "function") [size, callback] = [undefined, size];
++
++  try {
++    randomFillSync(buffer, offset, size);
++    queueMicrotask(() => callback(null, buffer));
++  } catch (e) {
++    queueMicrotask(() => callback(e));
++  }
++}
++
+ export const cryptoShim = {
+   randomBytes,
++  randomFillSync,
++  randomFill,
+   createHash,
+   scrypt,
+   randomUUID,
 diff --git a/packages/shim/src/fs/sync.js b/packages/shim/src/fs/sync.js
 index bb9a73d..68581ee 100644
 --- a/packages/shim/src/fs/sync.js
@@ -1051,6 +1087,113 @@ index 0000000..32afc81
 +    expect(fs.existsSync("/not-the-cli")).toBe(false);
 +  });
 +});
+diff --git a/packages/shim/src/node/events.js b/packages/shim/src/node/events.js
+index c9f9191..6ed6850 100644
+--- a/packages/shim/src/node/events.js
++++ b/packages/shim/src/node/events.js
+@@ -96,6 +96,20 @@ export class EventEmitter {
+     return Object.keys(this._events);
+   }
+ 
++  prependOnceListener(event, listener) {
++    const wrapped = (...args) => {
++      this.removeListener(event, wrapped);
++      listener.apply(this, args);
++    };
++
++    wrapped._original = listener;
++    return this.prependListener(event, wrapped);
++  }
++
++  rawListeners(event) {
++    return (this._events[event] || []).slice();
++  }
++
+   setMaxListeners() {
+     return this;
+   }
+@@ -105,4 +119,81 @@ export class EventEmitter {
+   }
+ }
+ 
++// local patch 0007: the names Node's `events` module carries besides the class. They are reached as
++// `require("events").setMaxListeners(...)` and the like, and are not the instance methods of the same name: a plugin
++// that replaces one (the Claudian plugin wraps `setMaxListeners` to swallow a warning Electron causes) reads it off
++// the module and fails on `undefined` without these.
++
++/** Node's events.setMaxListeners(n, ...targets): on each target given, else the default for new emitters. */
++EventEmitter.setMaxListeners = function setMaxListeners(n, ...targets) {
++  if (targets.length === 0) {
++    EventEmitter.defaultMaxListeners = n;
++    return;
++  }
++
++  for (const target of targets) {
++    target?.setMaxListeners?.(n);
++  }
++};
++
++/** Node's events.once(emitter, name): resolves with the arguments of the next such event. */
++EventEmitter.once = function once(emitter, name) {
++  return new Promise((resolve, reject) => {
++    const onEvent = (...args) => {
++      emitter.removeListener?.("error", onError);
++      resolve(args);
++    };
++    const onError = (error) => {
++      emitter.removeListener?.(name, onEvent);
++      reject(error);
++    };
++
++    emitter.once?.(name, onEvent);
++
++    if (name !== "error") {
++      emitter.once?.("error", onError);
++    }
++  });
++};
++
++/** Node's events.on(emitter, name): each such event in turn, for `for await`. */
++EventEmitter.on = function on(emitter, name) {
++  const queue = [];
++  let wake = null;
++  emitter.on?.(name, (...args) => {
++    queue.push(args);
++    wake?.();
++  });
++
++  return {
++    [Symbol.asyncIterator]() {
++      return this;
++    },
++    async next() {
++      if (queue.length === 0) {
++        await new Promise((resolve) => {
++          wake = () => {
++            wake = null;
++            resolve();
++          };
++        });
++      }
++
++      return { value: queue.shift(), done: false };
++    },
++  };
++};
++
++EventEmitter.getEventListeners = (emitter, name) => emitter.listeners?.(name) ?? [];
++EventEmitter.listenerCount = (emitter, name) => emitter.listenerCount?.(name) ?? 0;
++EventEmitter.defaultMaxListeners = 10;
++EventEmitter.errorMonitor = Symbol("events.errorMonitor");
++EventEmitter.captureRejectionSymbol = Symbol("nodejs.rejection");
++
++export const setMaxListeners = EventEmitter.setMaxListeners;
++export const once = EventEmitter.once;
++export const on = EventEmitter.on;
++export const getEventListeners = EventEmitter.getEventListeners;
++export const defaultMaxListeners = EventEmitter.defaultMaxListeners;
++
+ export default EventEmitter;
 diff --git a/packages/shim/src/node/module.js b/packages/shim/src/node/module.js
 new file mode 100644
 index 0000000..70ec0e5
@@ -1503,10 +1646,10 @@ index 0000000..7ba1882
 +  });
 +});
 diff --git a/packages/shim/src/require.js b/packages/shim/src/require.js
-index 5993e05..0d77516 100644
+index 5993e05..d81e474 100644
 --- a/packages/shim/src/require.js
 +++ b/packages/shim/src/require.js
-@@ -15,6 +15,11 @@ import * as utilShim from "./node/util.js";
+@@ -15,8 +15,19 @@ import * as utilShim from "./node/util.js";
  import { constantsShim } from "./node/constants.js";
  import { assertShim } from "./node/assert.js";
  import * as streamShim from "./node/stream.js";
@@ -1517,8 +1660,25 @@ index 5993e05..0d77516 100644
 +import * as moduleShim from "./node/module.js";
  import { wrapWithProxy, installDebugHelpers } from "./debug.js";
  
++// local patch 0007: in Node, `require("events")` is the EventEmitter class itself, with the module's other names
++// hung off it, so `class X extends require("events")` is ordinary code. Handing back the module namespace instead
++// makes that throw "Class extends value #<Object> is not a constructor" -- which the ws library bundled into the
++// Claudian plugin does as it loads. The class is registered, carrying the namespace's names.
++const eventsModule = Object.assign(eventsShim.EventEmitter, eventsShim);
++
  const rawRegistry = {
-@@ -38,6 +43,11 @@ const rawRegistry = {
+   electron: electronShim,
+   "@electron/remote": remoteShim,
+@@ -28,7 +39,7 @@ const rawRegistry = {
+   crypto: cryptoShim,
+   process: processShim,
+   child_process: childProcessShim,
+-  events: eventsShim,
++  events: eventsModule,
+   os: osShim,
+   net: netShim,
+   http: httpShim,
+@@ -38,6 +49,11 @@ const rawRegistry = {
    constants: constantsShim,
    assert: assertShim,
    stream: streamShim,
@@ -1530,3 +1690,154 @@ index 5993e05..0d77516 100644
  };
  
  const shimRegistry = {};
+diff --git a/packages/shim/src/require.test.js b/packages/shim/src/require.test.js
+index cf42408..12718e7 100644
+--- a/packages/shim/src/require.test.js
++++ b/packages/shim/src/require.test.js
+@@ -1,44 +1,116 @@
+-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+-
+-describe("window.require", () => {
+-  const stubs = {
+-    window: globalThis,
+-    matchMedia: () => ({ matches: false, addEventListener() {} }),
+-    document: { body: { classList: { contains: () => false } } },
+-    location: { origin: "http://localhost", href: "http://localhost/" },
+-    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
++// local patch 0007: the shape of the modules require() gives back, where a plugin depends on it being Node's shape.
++import { describe, expect, it, beforeEach, vi } from "vitest";
++
++import { cryptoShim } from "./crypto/index.js";
++
++// require.js pulls in the electron shim, which reads window as it loads, and this project has no DOM for tests.
++// The window stands in first, then the module is brought in: a static import would be evaluated before either.
++async function freshRequire() {
++  const browserBits = {
++    innerWidth: 1280,
++    innerHeight: 800,
++    matchMedia: () => ({
++      matches: false,
++      addEventListener() {},
++      removeEventListener() {},
++      addListener() {},
++      removeListener() {},
++    }),
+   };
++  vi.stubGlobal("window", Object.assign(globalThis, browserBits));
++  const { installRequire } = await import("./require.js");
++  installRequire();
++  return window.require;
++}
++
++describe("require('events')", () => {
++  let require_;
+ 
+-  beforeAll(async () => {
+-    Object.assign(globalThis, stubs);
+-    const { installRequire } = await import("./require.js");
+-    installRequire();
++  beforeEach(async () => {
++    require_ = await freshRequire();
+   });
+ 
+-  afterAll(() => {
+-    delete globalThis.require;
++  it("is the EventEmitter class, so a plugin may extend it", () => {
++    const events = require_("events");
++
++    // Node's `events` module is the class itself. The ws library inside the Claudian plugin writes
++    // `class WebSocket extends require("events")`, which threw "Class extends value #<Object> is not a
++    // constructor" while this gave back the module namespace instead.
++    expect(typeof events).toBe("function");
++
++    class Thing extends events {}
++    const t = new Thing();
++    const heard = [];
++    t.on("ping", (x) => heard.push(x));
++    t.emit("ping", 1);
+ 
+-    for (const key of Object.keys(stubs)) {
+-      delete globalThis[key];
+-    }
++    expect(heard).toEqual([1]);
+   });
+ 
+-  it("resolves process and node:process to the process shim", () => {
+-    const process = window.require("process");
++  it("carries the module-level names Node has, which are not the instance methods", async () => {
++    const events = require_("events");
+ 
+-    expect(window.require("node:process")).toBe(process);
+-    expect(process.cwd()).toBe("/");
+-    expect(process.platform).toBe("linux");
++    // The Claudian plugin wraps events.setMaxListeners to swallow a warning Electron causes, reading it off the
++    // module: `if (require("events").setMaxListeners.__electronPatched) return`. Without the static that threw
++    // "Cannot read properties of undefined".
++    expect(typeof events.setMaxListeners).toBe("function");
++    expect(typeof events.once).toBe("function");
++    expect(typeof events.on).toBe("function");
++    expect(events.defaultMaxListeners).toBe(10);
++
++    // It is replaceable, as that plugin replaces it.
++    const original = events.setMaxListeners;
++    const patched = () => {};
++    patched.__electronPatched = true;
++    events.setMaxListeners = patched;
++    expect(events.setMaxListeners.__electronPatched).toBe(true);
++    events.setMaxListeners = original;
++
++    // setMaxListeners passes the number on to each target it is given.
++    const seen = [];
++    original(32, { setMaxListeners: (n) => seen.push(n) }, { setMaxListeners: (n) => seen.push(n) });
++    expect(seen).toEqual([32, 32]);
++
++    // once() resolves with the event's arguments.
++    const emitter = new events();
++    const waited = events.once(emitter, "ready");
++    emitter.emit("ready", "ok");
++    expect(await waited).toEqual(["ok"]);
+   });
+ 
+-  it("resolves fs/promises and node:fs/promises to fs.promises", () => {
+-    const promises = window.require("fs").promises;
++  it("still carries the names a plugin may ask for by hand", () => {
++    const events = require_("events");
++
++    expect(events.EventEmitter).toBe(events);
++    expect(typeof events.default).toBe("function");
++    expect(require_("node:events")).toBe(events);
++  });
++});
++
++describe("crypto.randomFillSync", () => {
++  it("fills a buffer the caller already has, and gives it back", () => {
++    const buffer = new Uint8Array(16);
++    const same = cryptoShim.randomFillSync(buffer);
++
++    expect(same).toBe(buffer);
++    expect(buffer.some((b) => b !== 0)).toBe(true); // not left as zeroes
++  });
++
++  it("fills only the part asked for", () => {
++    const buffer = new Uint8Array(8);
++    cryptoShim.randomFillSync(buffer, 4, 4);
++
++    expect(buffer.slice(0, 4).every((b) => b === 0)).toBe(true);
++    expect(buffer.slice(4).some((b) => b !== 0)).toBe(true);
++  });
+ 
+-    for (const name of ["fs/promises", "node:fs/promises"]) {
+-      const required = window.require(name);
++  it("has a callback form, as Node does", async () => {
++    const buffer = new Uint8Array(8);
++    const filled = await new Promise((resolve, reject) =>
++      cryptoShim.randomFill(buffer, (e, b) => (e ? reject(e) : resolve(b))),
++    );
+ 
+-      expect(required.readFile).toBe(promises.readFile);
+-      expect(required.writeFile).toBe(promises.writeFile);
+-    }
++    expect(filled).toBe(buffer);
++    expect(buffer.some((b) => b !== 0)).toBe(true);
+   });
+ });
