@@ -232,6 +232,214 @@ index 40050b6..1fe77cc 100644
    console.log(`[ignis] Vault root: ${config.vaultRoot}`);
    console.log(`[ignis] Vaults: ${Object.keys(config.vaults).join(", ")}`);
  
+diff --git a/apps/ignis-server/server/routes/local-relay.js b/apps/ignis-server/server/routes/local-relay.js
+new file mode 100644
+index 0000000..b443fc9
+--- /dev/null
++++ b/apps/ignis-server/server/routes/local-relay.js
+@@ -0,0 +1,84 @@
++// local patch 0006: the same-origin relay to services on the computer that runs Ignis.
++//
++// A plugin in the browser asks `<this page's origin>/relay/<service>/<path>`; this route streams the request, and the
++// answer (server-sent events too), through the named pipe the launcher (ignis/ignis_native.py) serves outside the
++// sandbox, whose name it passes in IGNIS_LOCAL_RELAY. The launcher decides, per service, which requests may pass and
++// which local port answers them (ignis/SETUP.md, "The relay"); this side only checks the form of the request.
++// Same origin: no CORS, and Cloudflare Access's session covers it. A cross-site page cannot use it: a request with an
++// Origin header must come from this host or from WS_ORIGINS. Cookies and credentials are not forwarded.
++
++const http = require("http");
++
++const SERVICE = /^[a-z][a-z0-9-]{0,31}$/;
++// headers a local service needs; everything else (cookies, Cloudflare Access's tokens, forwarding headers) stays here
++const FORWARDED = new Set(["accept", "accept-language", "content-type", "content-length", "last-event-id", "cache-control", "user-agent"]);
++// the two services the launcher answers itself get Cloudflare Access's token, which it verifies before it acts:
++// the LaTeX build (2026-10-28) and Claude Code (2026-11-04), each of which runs a program on the computer.
++// No other service sees it.
++const TOKEN_FOR = new Set(["latex", "claude"]);
++// Quarry's service checks a token of its own, `Authorization: Bearer` (2026-10-30): passed on to it and to no other
++// service; every other credential of the browser stays here
++const AUTHORIZATION_FOR = new Set(["quarry"]);
++
++function forwardedHeaders(headers, service = "") {
++  const out = {};
++  for (const [k, v] of Object.entries(headers || {})) {
++    const key = k.toLowerCase();
++    if (FORWARDED.has(key) || (key === "cf-access-jwt-assertion" && TOKEN_FOR.has(service)) || (key === "authorization" && AUTHORIZATION_FOR.has(service))) out[key] = v;
++  }
++  out.host = "relay";
++  out.connection = "close";
++  return out;
++}
++
++// Whether the request came from this page (no Origin: a same-origin GET, or not a browser) or an allowed origin.
++function originAllowed(req, allowlist) {
++  const origin = req.headers.origin;
++  if (!origin) return true;
++  try {
++    if (new URL(origin).host === req.headers.host) return true;
++  } catch {
++    return false;
++  }
++  return (allowlist || []).includes(origin);
++}
++
++function localRelay({ pipe = process.env.IGNIS_LOCAL_RELAY || "", originAllowlist = [] } = {}) {
++  return (req, res) => {
++    // req.url is relative to the mount point: "/quarry/health?x=1"
++    const [first, ...rest] = req.url.replace(/^\/+/, "").split("/");
++    const service = first || "";
++    if (!SERVICE.test(service)) {
++      return res.status(404).json({ error: "no such relay service" });
++    }
++    if (!originAllowed(req, originAllowlist)) {
++      console.warn(`relay: refused ${req.method} /relay/${service}: origin ${req.headers.origin}`);
++      return res.status(403).json({ error: "the relay serves only this page" });
++    }
++    if (!pipe) {
++      return res.status(503).json({ error: "the relay is off: the launcher did not set IGNIS_LOCAL_RELAY" });
++    }
++    const upstream = http.request(
++      { socketPath: pipe, method: req.method, path: `/${service}/${rest.join("/")}`, headers: forwardedHeaders(req.headers, service), agent: false },
++      (up) => {
++        const headers = { ...up.headers };
++        delete headers.connection;
++        res.writeHead(up.statusCode || 502, headers);
++        if (typeof res.flushHeaders === "function") res.flushHeaders(); // an event stream starts at once
++        up.pipe(res);
++      },
++    );
++    upstream.on("error", (e) => {
++      if (!res.headersSent) {
++        res.status(502).json({ error: `the relay is not running (${e.code || e.message}): is the launcher up?` });
++      } else {
++        res.end();
++      }
++    });
++    // the page went away (an EventSource closed): stop the request on the other side too
++    res.on("close", () => upstream.destroy());
++    req.pipe(upstream);
++  };
++}
++
++module.exports = { localRelay, forwardedHeaders, originAllowed };
+diff --git a/apps/ignis-server/server/routes/local-relay.test.mjs b/apps/ignis-server/server/routes/local-relay.test.mjs
+new file mode 100644
+index 0000000..2201147
+--- /dev/null
++++ b/apps/ignis-server/server/routes/local-relay.test.mjs
+@@ -0,0 +1,112 @@
++import { describe, it, expect, afterEach } from "vitest";
++import { createRequire } from "module";
++import http from "node:http";
++
++const require = createRequire(import.meta.url);
++const express = require("express");
++const { localRelay, forwardedHeaders } = require("./local-relay.js");
++
++const servers = [];
++afterEach(() => {
++  for (const s of servers.splice(0)) s.close();
++});
++
++function listen(server, at) {
++  servers.push(server);
++  return new Promise((resolve) => server.listen(at, resolve));
++}
++
++// the launcher's side: an HTTP server on a named pipe (a Unix socket elsewhere), recording what it was sent
++async function fakeLauncher(handler) {
++  const pipe = process.platform === "win32" ? `\\\\.\\pipe\\ignis-relay-test-${process.pid}-${Math.random().toString(36).slice(2)}` : `/tmp/ignis-relay-test-${process.pid}-${Date.now()}.sock`;
++  const seen = [];
++  await listen(http.createServer((req, res) => {
++    let body = "";
++    req.on("data", (c) => (body += c));
++    req.on("end", () => {
++      seen.push({ method: req.method, url: req.url, headers: req.headers, body });
++      handler(req, res);
++    });
++  }), pipe);
++  return { pipe, seen };
++}
++
++async function ignis(pipe) {
++  const app = express();
++  app.use("/relay", localRelay({ pipe, originAllowlist: ["https://allowed.example"] }));
++  const server = http.createServer(app);
++  await listen(server, 0);
++  return `http://127.0.0.1:${server.address().port}`;
++}
++
++describe("local relay", () => {
++  it("passes a request and its body through the pipe, without cookies", async () => {
++    const { pipe, seen } = await fakeLauncher((req, res) => {
++      res.writeHead(200, { "content-type": "application/json" });
++      res.end('{"ok":true}');
++    });
++    const base = await ignis(pipe);
++    const r = await fetch(`${base}/relay/quarry/search?x=1`, { method: "POST", headers: { "content-type": "application/json", cookie: "CF_Authorization=secret" }, body: '{"q":"a"}' });
++    expect(r.status).toBe(200);
++    expect(await r.json()).toEqual({ ok: true });
++    expect(seen[0].method).toBe("POST");
++    expect(seen[0].url).toBe("/quarry/search?x=1");
++    expect(seen[0].body).toBe('{"q":"a"}');
++    expect(seen[0].headers.cookie).toBeUndefined();
++  });
++
++  it("streams an event stream as it comes", async () => {
++    const { pipe } = await fakeLauncher((req, res) => {
++      res.writeHead(200, { "content-type": "text/event-stream" });
++      res.write("data: one\n\n");
++      setTimeout(() => res.end("data: two\n\n"), 200);
++    });
++    const base = await ignis(pipe);
++    const r = await fetch(`${base}/relay/quarry/events`);
++    const reader = r.body.getReader();
++    const first = new TextDecoder().decode((await reader.read()).value);
++    expect(first).toBe("data: one\n\n"); // before the second part was written
++    await reader.cancel();
++  });
++
++  it("refuses another site, a bad service name, and says when the relay is off", async () => {
++    const { pipe, seen } = await fakeLauncher((req, res) => res.end("x"));
++    const base = await ignis(pipe);
++    expect((await fetch(`${base}/relay/quarry/health`, { headers: { origin: "https://evil.example" } })).status).toBe(403);
++    expect((await fetch(`${base}/relay/quarry/health`, { headers: { origin: "https://allowed.example" } })).status).toBe(200);
++    expect((await fetch(`${base}/relay/..%2F/health`)).status).toBe(404);
++    expect((await fetch(`${base}/relay/UPPER/health`)).status).toBe(404);
++    expect(seen.length).toBe(1);
++    const off = await ignis("");
++    expect((await fetch(`${off}/relay/quarry/health`)).status).toBe(503);
++  });
++
++  it("says so when nothing serves the pipe", async () => {
++    const base = await ignis(process.platform === "win32" ? "\\\\.\\pipe\\ignis-relay-test-nobody" : "/tmp/ignis-relay-test-nobody.sock");
++    const r = await fetch(`${base}/relay/quarry/health`);
++    expect(r.status).toBe(502);
++    expect((await r.json()).error).toMatch(/relay is not running/);
++  });
++
++  it("forwards only the headers a service needs", () => {
++    expect(forwardedHeaders({ Cookie: "a", Authorization: "b", "cf-access-jwt-assertion": "c", "Content-Type": "x", "Last-Event-ID": "4" })).toEqual({ "content-type": "x", "last-event-id": "4", host: "relay", connection: "close" });
++  });
++
++  it("gives Cloudflare Access's token to the services the launcher answers itself, and to no other", () => {
++    const token = { "cf-access-jwt-assertion": "c", Cookie: "a" };
++
++    // Each of these runs a program on the computer, and the launcher checks the token before it does.
++    for (const service of ["latex", "claude"]) {
++      expect(forwardedHeaders(token, service)["cf-access-jwt-assertion"], service).toBe("c");
++    }
++
++    // Everything else sees none of it. `claude` was left out of this list when its service was written, so every
++    // request to it was refused for want of a token, which the plugin reported as "process exited with code 1".
++    for (const service of ["quarry", "augmented-view", "", "latex-other"]) {
++      expect(forwardedHeaders(token, service)["cf-access-jwt-assertion"], service).toBeUndefined();
++    }
++
++    // The cookie never leaves, whichever service it is.
++    expect(forwardedHeaders(token, "claude").cookie).toBeUndefined();
++  });
++});
 diff --git a/packages/shim/src/crypto/index.js b/packages/shim/src/crypto/index.js
 index 6272a20..042bde0 100644
 --- a/packages/shim/src/crypto/index.js
@@ -310,6 +518,67 @@ index bb9a73d..68581ee 100644
        const resolved = resolvePath(path);
  
        if (!metadataCache.has(resolved)) {
+diff --git a/packages/shim/src/globals/index.js b/packages/shim/src/globals/index.js
+index 90ee30c..d8da66f 100644
+--- a/packages/shim/src/globals/index.js
++++ b/packages/shim/src/globals/index.js
+@@ -19,6 +19,47 @@ function installGlobalAlias() {
+   window.global = window;
+ }
+ 
++// local patch 0007: the two CommonJS names Obsidian gives a plugin on the desktop, where its code is loaded as a
++// module with `module`, `exports`, `require`, `__filename` and `__dirname` around it. In a browser the first three
++// are provided and the last two were not, so a plugin that mentions `__filename` -- the Claude Agent SDK inside the
++// Claudian plugin does, to find a CLI bundled beside itself -- stopped with "__filename is not defined".
++//
++// One value serves every plugin, where the desktop gives each its own. Nothing reads the path: it is handed to
++// createRequire, whose answer here is the shim's own require. A plugin that goes looking for a file beside itself
++// will not find it, which is the truth of the matter in a browser and is reported as such.
++// local patch 0007: a stand-in for SharedArrayBuffer, which Node always has and a browser only offers to a page
++// that is cross-origin isolated (COOP and COEP headers, a Spectre precaution). Asking Ignis to serve those headers
++// would mean every resource the page loads needing CORP headers too, which is a large change to make for this.
++//
++// What wants it here: code that sleeps between retries of a file write that hit a Windows lock (EPERM, EBUSY) --
++// `new Int32Array(new SharedArrayBuffer(4))` for Atomics.wait to block on. It is not shared with another thread,
++// so a plain ArrayBuffer carries it. Atomics.wait cannot block the page's only thread in any case, so it is made
++// to answer "timed-out" at once rather than throw: a retry then happens without the pause, which is the closest a
++// browser can come, instead of the write failing outright.
++export function installSharedMemoryStandIn() {
++  if (typeof window.SharedArrayBuffer === "undefined") {
++    window.SharedArrayBuffer = ArrayBuffer;
++  }
++
++  const shared = typeof window.SharedArrayBuffer === "function" && window.SharedArrayBuffer !== ArrayBuffer;
++
++  if (!shared && typeof Atomics === "object" && typeof Atomics.wait === "function") {
++    const wait = Atomics.wait.bind(Atomics);
++    Atomics.wait = (typedArray, index, value, timeout) => {
++      try {
++        return wait(typedArray, index, value, timeout);
++      } catch {
++        return "timed-out"; // not shared memory, and this thread may not block: carry on without the pause
++      }
++    };
++  }
++}
++
++export function installModulePaths() {
++  window.__filename = "/plugin.js";
++  window.__dirname = "/";
++}
++
+ function installContextMenuFix() {
+   // hacky fix to prevent browser from showing context menu while allowing obsidian context menu
+   window.addEventListener(
+@@ -41,6 +82,8 @@ function installContextMenuFix() {
+ 
+ export function installGlobals() {
+   installGlobalAlias();
++  installModulePaths();
++  installSharedMemoryStandIn();
+   installProcess();
+   installBuffer();
+   installFetchShim();
 diff --git a/packages/shim/src/node/async_hooks.js b/packages/shim/src/node/async_hooks.js
 new file mode 100644
 index 0000000..5caed19
@@ -1196,15 +1465,27 @@ index c9f9191..6ed6850 100644
  export default EventEmitter;
 diff --git a/packages/shim/src/node/module.js b/packages/shim/src/node/module.js
 new file mode 100644
-index 0000000..70ec0e5
+index 0000000..5ac6e5b
 --- /dev/null
 +++ b/packages/shim/src/node/module.js
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,34 @@
 +// local patch 0007: Node's module, only what a bundle built for Node asks of it on the way in. createRequire gives
 +// back the shim's own require, so a plugin that makes its own require ends up with the shimmed modules.
 +
 +export function createRequire() {
-+  return window.require;
++  // The shim's own require, with a resolve() that says plainly why there is no answer. A plugin calls
++  // createRequire(__filename).resolve("some/package") to find a file shipped beside its own code; in a browser
++  // there is no such file and no module path to search. Saying so beats "resolve is not a function", and beats
++  // the ReferenceError that came before __filename existed at all.
++  const required = (name) => window.require(name);
++  required.resolve = (name) => {
++    throw new Error(
++      `Cannot resolve '${name}': a plugin's files cannot be looked up by path in the browser. ` +
++        "If this is a program the plugin wants to run, set its path in the plugin's own settings.",
++    );
++  };
++  required.cache = {};
++  return required;
 +}
 +
 +export const builtinModules = [];
@@ -1691,10 +1972,10 @@ index 5993e05..d81e474 100644
  
  const shimRegistry = {};
 diff --git a/packages/shim/src/require.test.js b/packages/shim/src/require.test.js
-index cf42408..12718e7 100644
+index cf42408..7830fef 100644
 --- a/packages/shim/src/require.test.js
 +++ b/packages/shim/src/require.test.js
-@@ -1,44 +1,116 @@
+@@ -1,44 +1,160 @@
 -import { describe, it, expect, beforeAll, afterAll } from "vitest";
 -
 -describe("window.require", () => {
@@ -1731,17 +2012,11 @@ index cf42408..12718e7 100644
 +
 +describe("require('events')", () => {
 +  let require_;
- 
--  beforeAll(async () => {
--    Object.assign(globalThis, stubs);
--    const { installRequire } = await import("./require.js");
--    installRequire();
++
 +  beforeEach(async () => {
 +    require_ = await freshRequire();
-   });
- 
--  afterAll(() => {
--    delete globalThis.require;
++  });
++
 +  it("is the EventEmitter class, so a plugin may extend it", () => {
 +    const events = require_("events");
 +
@@ -1756,20 +2031,21 @@ index cf42408..12718e7 100644
 +    t.on("ping", (x) => heard.push(x));
 +    t.emit("ping", 1);
  
--    for (const key of Object.keys(stubs)) {
--      delete globalThis[key];
--    }
+-  beforeAll(async () => {
+-    Object.assign(globalThis, stubs);
+-    const { installRequire } = await import("./require.js");
+-    installRequire();
 +    expect(heard).toEqual([1]);
    });
  
--  it("resolves process and node:process to the process shim", () => {
--    const process = window.require("process");
+-  afterAll(() => {
+-    delete globalThis.require;
 +  it("carries the module-level names Node has, which are not the instance methods", async () => {
 +    const events = require_("events");
  
--    expect(window.require("node:process")).toBe(process);
--    expect(process.cwd()).toBe("/");
--    expect(process.platform).toBe("linux");
+-    for (const key of Object.keys(stubs)) {
+-      delete globalThis[key];
+-    }
 +    // The Claudian plugin wraps events.setMaxListeners to swallow a warning Electron causes, reading it off the
 +    // module: `if (require("events").setMaxListeners.__electronPatched) return`. Without the static that threw
 +    // "Cannot read properties of undefined".
@@ -1796,28 +2072,33 @@ index cf42408..12718e7 100644
 +    const waited = events.once(emitter, "ready");
 +    emitter.emit("ready", "ok");
 +    expect(await waited).toEqual(["ok"]);
-   });
- 
--  it("resolves fs/promises and node:fs/promises to fs.promises", () => {
--    const promises = window.require("fs").promises;
++  });
++
 +  it("still carries the names a plugin may ask for by hand", () => {
 +    const events = require_("events");
 +
 +    expect(events.EventEmitter).toBe(events);
 +    expect(typeof events.default).toBe("function");
 +    expect(require_("node:events")).toBe(events);
-+  });
+   });
 +});
-+
+ 
+-  it("resolves process and node:process to the process shim", () => {
+-    const process = window.require("process");
 +describe("crypto.randomFillSync", () => {
 +  it("fills a buffer the caller already has, and gives it back", () => {
 +    const buffer = new Uint8Array(16);
 +    const same = cryptoShim.randomFillSync(buffer);
-+
+ 
+-    expect(window.require("node:process")).toBe(process);
+-    expect(process.cwd()).toBe("/");
+-    expect(process.platform).toBe("linux");
 +    expect(same).toBe(buffer);
 +    expect(buffer.some((b) => b !== 0)).toBe(true); // not left as zeroes
-+  });
-+
+   });
+ 
+-  it("resolves fs/promises and node:fs/promises to fs.promises", () => {
+-    const promises = window.require("fs").promises;
 +  it("fills only the part asked for", () => {
 +    const buffer = new Uint8Array(8);
 +    cryptoShim.randomFillSync(buffer, 4, 4);
@@ -1825,19 +2106,63 @@ index cf42408..12718e7 100644
 +    expect(buffer.slice(0, 4).every((b) => b === 0)).toBe(true);
 +    expect(buffer.slice(4).some((b) => b !== 0)).toBe(true);
 +  });
- 
--    for (const name of ["fs/promises", "node:fs/promises"]) {
--      const required = window.require(name);
++
 +  it("has a callback form, as Node does", async () => {
 +    const buffer = new Uint8Array(8);
 +    const filled = await new Promise((resolve, reject) =>
 +      cryptoShim.randomFill(buffer, (e, b) => (e ? reject(e) : resolve(b))),
 +    );
++
++    expect(filled).toBe(buffer);
++    expect(buffer.some((b) => b !== 0)).toBe(true);
++  });
++});
++
++describe("the CommonJS names Obsidian gives a plugin", () => {
++  it("defines __filename and __dirname, which a browser does not", async () => {
++    await freshRequire();
++    const { installModulePaths } = await import("./globals/index.js");
++    installModulePaths(); // what installGlobals() calls at start-up; the rest of it needs a real browser
++
++    // The Claude Agent SDK inside the Claudian plugin reads __filename to find a CLI bundled beside itself.
++    // Without these the session died with "__filename is not defined".
++    expect(typeof window.__filename).toBe("string");
++    expect(typeof window.__dirname).toBe("string");
++  });
++
++  it("gives createRequire a resolve() that explains itself instead of throwing a type error", async () => {
++    const require_ = await freshRequire();
++    const made = require_("module").createRequire(window.__filename);
++
++    expect(typeof made).toBe("function");
++    expect(made("path")).toBe(require_("path"));
++    expect(() => made.resolve("@anthropic-ai/claude-code/cli.js")).toThrow(/cannot be looked up by path/);
++  });
++});
++
++describe("SharedArrayBuffer, which a browser withholds unless the page is cross-origin isolated", () => {
++  it("stands one in, so code that only wants a small buffer still runs", async () => {
++    vi.stubGlobal("window", globalThis);
++    const saved = globalThis.SharedArrayBuffer;
++    // As a browser without COOP/COEP: the name is simply absent.
++    delete globalThis.SharedArrayBuffer;
++
++    const { installSharedMemoryStandIn } = await import("./globals/index.js");
++    installSharedMemoryStandIn();
++
++    // The line that failed in the Claudian plugin: a four-byte buffer to sleep on between write retries.
++    const cell = new Int32Array(new window.SharedArrayBuffer(4));
++    expect(cell.length).toBe(1);
+ 
+-    for (const name of ["fs/promises", "node:fs/promises"]) {
+-      const required = window.require(name);
++    // Atomics.wait cannot block the page's thread, and throws on memory that is not shared. It answers at once
++    // instead, so a retry happens without the pause rather than the write failing.
++    expect(Atomics.wait(cell, 0, 0, 5)).toBe("timed-out");
  
 -      expect(required.readFile).toBe(promises.readFile);
 -      expect(required.writeFile).toBe(promises.writeFile);
 -    }
-+    expect(filled).toBe(buffer);
-+    expect(buffer.some((b) => b !== 0)).toBe(true);
++    globalThis.SharedArrayBuffer = saved;
    });
  });

@@ -1254,6 +1254,7 @@ CLAUDE_IDLE = 1800.0  # a session whose output nothing is reading for this long 
 CLAUDE_INPUT_LIMIT = 1 << 20  # the most one write to the CLI's input may carry
 CLAUDE_ARGS_LIMIT = 1 << 18  # the most all the arguments of one start may carry
 CLAUDE_ARGS_COUNT = 400
+CLAUDE_TAIL = 600  # how much of what a session last said is kept, for the log when it ends badly
 # Arguments refused: --add-dir would ask the CLI to work outside the vault (the container's rules stop it reaching
 # anywhere else in any case, so this only makes the refusal clear instead of a puzzling permission error).
 CLAUDE_REFUSED = ("--add-dir",)
@@ -1552,10 +1553,12 @@ class ClaudeSession:
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self) -> None:
+        tail = b""  # the last of what the CLI said, for the log when it ends badly
         try:
             while chunk := self.process.output.read1(65536):
                 with self.lock:
                     self.chunks.append(chunk)
+                tail = (tail + chunk)[-CLAUDE_TAIL:]
                 self.ready.set()
         except OSError:
             pass
@@ -1563,7 +1566,14 @@ class ClaudeSession:
         with self.lock:
             self.exit = code
         self.ready.set()
-        log(f"claude: session {self.id} (pid {self.pid}) ended, exit {code}")
+        if code == 0:
+            log(f"claude: session {self.id} (pid {self.pid}) ended, exit {code}")
+        else:
+            # Why it ended is in what it wrote, which otherwise goes only to the browser. Without this the log said
+            # "exit 1" and nothing else, and the plugin said "Claude Code process exited with code 1".
+            said = " / ".join(line.strip() for line in tail.decode("utf-8", "replace").splitlines() if line.strip())
+            log(f"claude: session {self.id} (pid {self.pid}) ended, exit {code}"
+                + (f" -- it said: {said[-CLAUDE_TAIL:]}" if said else " -- it said nothing"))
 
     def take(self) -> list[bytes]:
         with self.lock:
